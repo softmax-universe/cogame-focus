@@ -72,8 +72,10 @@ suite "scripted baseline":
     expect FocusError:
       discard client.decide(sim, sim.turn, "attack the centre",
         scripted = false, selection = PromptSelection())
+    check client.lastFailureCause == "missing"
     let decision = client.decide(sim, sim.turn, "",
       scripted = true, selection = PromptSelection())
+    check client.lastFailureCause == ""
     sim.applyMove(sim.turn, decision.move)
 
   test "extractJsonObject accepts bare or single-fenced JSON objects only":

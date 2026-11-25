@@ -48,7 +48,7 @@ type
     ply*: int                      ## plies played so far
     done*: bool
     winner*: int                   ## -1 for a draw (or while live)
-    reason*: string                ## "no-moves" | "cap" | "deadline" | "forfeit"
+    reason*: string                ## "no-moves" | "cap" | "deadline"
     events*: seq[GameEvent]
 
 const CogNames* = [
@@ -339,19 +339,6 @@ proc endEarly*(sim: var Sim) =
     return
   sim.settle("deadline")
 
-proc forfeit*(sim: var Sim, seat: int) =
-  ## Ends the game immediately, awarding the win to the opposing seat.
-  if sim.done:
-    return
-  if seat < 0 or seat >= Seats:
-    raise newException(FocusError, "invalid forfeit seat")
-  sim.done = true
-  sim.reason = "forfeit"
-  sim.winner = 1 - seat
-  sim.turn = -1
-  sim.addEvent(GameEvent(kind: evEnd, seat: sim.winner, fromCell: -1,
-    toCell: -1, reserveAfter: -1, text: "forfeit"))
-
 # ---- Results ----------------------------------------------------------------
 
 proc resultsJson*(sim: Sim): JsonNode =
@@ -468,11 +455,8 @@ proc replayMatch*(config: GameConfig, events: seq[GameEvent]): seq[Sim] =
         toCell: event.toCell))
     of evEnd:
       if not sim.done:
-        if event.text == "forfeit" and event.seat >= 0 and event.seat < Seats:
-          sim.forfeit(1 - event.seat)
-        else:
-          ## A deadline stop is not derivable from the moves alone.
-          sim.settle(event.text)
+        ## A deadline stop is not derivable from the moves alone.
+        sim.settle(event.text)
     result.add(sim)
 
 # ---- Event JSON -------------------------------------------------------------

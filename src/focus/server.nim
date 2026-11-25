@@ -146,14 +146,15 @@ proc writeArtifact(uri, data, contentType, methodEnv: string) =
   else:
     writeCogameUri(uri, data, contentType, methodEnv)
 
-proc replayPayload(gs: GameState, results: JsonNode): string =
+proc replayPayload(gs: GameState, results: JsonNode,
+    failure: JsonNode = nil): string =
   var names = newJArray()
   for name in gs.sim.names:
     names.add(%name)
   var events = newJArray()
   for event in gs.sim.events:
     events.add(event.eventToJson())
-  $ %*{
+  var payload = %*{
     "protocol": "focus.replay.v" & $ReplayVersion,
     "names": names,
     "policyNames": gs.policyNamesJson(),
@@ -165,6 +166,9 @@ proc replayPayload(gs: GameState, results: JsonNode): string =
     "events": events,
     "results": results
   }
+  if not failure.isNil:
+    payload["failure"] = failure
+  $payload
 
 proc statesFromEvents(config: GameConfig, events: seq[GameEvent]): JsonNode =
   ## One board-state object per event prefix, for scrubbing replays.
@@ -221,6 +225,55 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
   sleep(500)
   echo "focus: episode complete, shutting down"
   quit(0)
+
+proc failEpisode(runtimeConfig: RuntimeConfig, seat: int, cause, detail: string) =
+  var replayData: string
+  var ply: int
+  withLock stateLock:
+    if state.finished:
+      return
+    state.finished = true
+    ply = state.sim.ply
+    let failure = %*{
+      "status": "failed",
+      "cause": cause,
+      "detail": detail,
+      "seat": seat,
+      "ply": ply,
+      "maxPlies": state.config.maxPlies,
+      "first": state.sim.first
+    }
+    replayData = state.replayPayload(newJNull(), failure)
+    try:
+      state.trajectory.finishFailedNativeTrajectory(state.sim, seat, cause, detail)
+    except CatchableError as error:
+      echo "focus: failed to write failed trajectory: ", error.msg
+    let notice = %*{
+      "type": "error",
+      "cause": cause,
+      "detail": detail,
+      "seat": seat,
+      "ply": ply
+    }
+    for _, socket in state.playerSockets:
+      try:
+        socket.send($notice)
+      except CatchableError:
+        discard
+
+  echo "focus: episode failed (cause=", cause, ", seat=", seat,
+    ", ply=", ply, "): ", detail
+  if runtimeConfig.replayUri.len > 0:
+    try:
+      echo "focus: writing partial replay diagnostics (no official results)"
+      writeArtifact(
+        runtimeConfig.replayUri, replayData, "application/octet-stream",
+        "COGAME_SAVE_REPLAY_METHOD"
+      )
+    except CatchableError as error:
+      echo "focus: failed to write partial replay: ", error.msg
+  sleep(200)
+  quit(1)
 
 const PlayBudgetFraction* = 0.6
   ## Share of the platform's episode timeout spent playing. The rest covers
@@ -305,14 +358,12 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         captureView = %*{"view":simCopy.tableStateJson(),
           "operator_prompt":seatPrompt, "header":header}
       if not registered:
+        let detail = "seat " & $seat & " not registered"
         withLock stateLock:
-          echo "focus: seat ", seat, " not registered; forfeiting"
-          state.sim.forfeit(seat)
           if not state.trajectory.isNil:
             state.trajectory.recordRejectedDecision(state.selection, simCopy.ply, seat,
               config.players[seat].name, captureView, @[], asMissing)
-          state.broadcastLocked()
-        break
+        failEpisode(runtimeConfig, seat, "missing", detail)
       if external:
         var sent = false
         withLock stateLock:
@@ -352,7 +403,8 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           if accepted or rejected or disconnected:
             break
           sleep(50)
-        var forfeited = false
+        var failCause = ""
+        var failDetail = ""
         withLock stateLock:
           state.pendingSeat = -1
           state.pendingAccepted = false
@@ -368,21 +420,23 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             echo "focus: ply ", state.sim.ply, " seat ", seat, " ",
               moveText(action),
               " at ", (epochTime() - gameStart).int, "s"
+            state.broadcastLocked()
           else:
-            let why =
-              if rejected: "rejected: " & rejectReason
-              elif disconnected: "disconnected"
-              else: "timed out"
-            echo "focus: external seat ", seat, " forfeited (", why, ")"
-            state.sim.forfeit(seat)
+            let status = if rejected: asRejected else: asMissing
+            if rejected:
+              failCause = "model_rejection"
+              failDetail = "external action rejected: " & rejectReason
+            elif disconnected:
+              failCause = "disconnected"
+              failDetail = "external seat disconnected"
+            else:
+              failCause = "timeout"
+              failDetail = "external seat timed out"
             if not state.trajectory.isNil:
-              let status = if rejected: asRejected else: asMissing
               state.trajectory.recordRejectedDecision(state.selection, simCopy.ply, seat,
                 config.players[seat].name, captureView, @[], status)
-            forfeited = true
-          state.broadcastLocked()
-        if forfeited:
-          break
+        if failCause.len > 0:
+          failEpisode(runtimeConfig, seat, failCause, failDetail)
         if config.turnDelayMs > 0:
           sleep(config.turnDelayMs)
         continue
@@ -398,17 +452,19 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         decideError = error.msg
 
       if decideError.len > 0:
+        let cause =
+          if client.lastFailureCause.len > 0: client.lastFailureCause
+          else: "provider"
+        let status =
+          if cause == "model_rejection": asRejected
+          else: asMissing
         withLock stateLock:
-          echo "focus: seat ", seat, " forfeited (", decideError, ")"
-          state.sim.forfeit(seat)
           if not state.trajectory.isNil:
-            let status = if client.nativeAttempts.len > 0: asRejected else: asMissing
             state.trajectory.recordRejectedDecision(state.selection, simCopy.ply, seat,
               config.players[seat].name, captureView, client.nativeAttempts, status)
-          state.broadcastLocked()
-        break
+        failEpisode(runtimeConfig, seat, cause, decideError)
 
-      var forfeited = false
+      var applyError = ""
       withLock stateLock:
         echo "focus: ply ", state.sim.ply + 1, " seat ", seat, " ",
           moveText(decision.move), " at ", (epochTime() - gameStart).int, "s"
@@ -422,16 +478,14 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             state.trajectory.recordAppliedDecision(state.selection, simCopy.ply, seat,
               config.players[seat].name, captureView,
               decision.decisionJson(), client.nativeAttempts, origin)
+          state.broadcastLocked()
         except FocusError as error:
-          echo "focus: seat ", seat, " move rejected (", error.msg, "); forfeiting"
-          state.sim.forfeit(seat)
+          applyError = error.msg
           if not state.trajectory.isNil:
             state.trajectory.recordRejectedDecision(state.selection, simCopy.ply, seat,
               config.players[seat].name, captureView, client.nativeAttempts, asRejected)
-          forfeited = true
-        state.broadcastLocked()
-      if forfeited:
-        break
+      if applyError.len > 0:
+        failEpisode(runtimeConfig, seat, "model_rejection", applyError)
 
       if config.turnDelayMs > 0:
         sleep(config.turnDelayMs)
@@ -614,7 +668,12 @@ proc websocketHandler(
                 state.pendingRejected = true
                 state.pendingRejectReason = bad
       except CatchableError as error:
-        echo "focus: ignoring bad player frame: ", error.msg
+        withLock stateLock:
+          if state.external[slot] and state.pendingSeat == slot and
+              not state.pendingAccepted and not state.pendingRejected:
+            state.pendingRejected = true
+            state.pendingRejectReason = error.msg
+        echo "focus: bad player frame from slot ", slot, ": ", error.msg
     of ErrorEvent:
       discard
     of CloseEvent:
