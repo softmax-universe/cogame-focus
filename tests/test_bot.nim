@@ -110,9 +110,11 @@ suite "scripted baseline":
     check defaultClient.bedrockUrl() ==
       "http://127.0.0.1:9999/model/us.anthropic.claude-haiku-4-5-20251001-v1:0/invoke"
 
-  test "extractJsonObject accepts bare or single-fenced JSON objects only":
+  test "the final move line or a standalone fence identifies the selected move":
     let bare = extractJsonObject("""{"say":"hi","move":"c7 x1 E -> d7"}""")
     check bare["move"].getStr() == "c7 x1 E -> d7"
+    let finalLine = extractJsonObject("Board analysis first.\n\n{\"move\":\"e6 x1 N -> e7\"}")
+    check finalLine["move"].getStr() == "e6 x1 N -> e7"
     let fencedJson = extractJsonObject("```json\n{\"move\":\"drop @ a4\"}\n```")
     check fencedJson["move"].getStr() == "drop @ a4"
     let fencedPlain = extractJsonObject("  ```\n{\"move\":\"drop @ a4\"}\n```  ")
@@ -193,7 +195,7 @@ suite "scripted baseline":
     let sys = systemPrompt(sim, 0, PromptSelection())
     let usr = userPrompt(sim, 0, "Play strong Focus.", "Ply 1 of at most 160.")
     check "Bluff, needle, and mislead" notin sys
-    check "Example: {\"move\": " & $(%legalMove) & "}" in usr
+    check $(%*{"move": legalMove}) in usr
     check legalMove in usr
     ## Drop-only position: example must be a legal drop ID.
     for cell in 0 ..< Cells:
@@ -203,5 +205,5 @@ suite "scripted baseline":
     let dropLegal = moveText(sim.legalMoves(0)[0])
     check dropLegal.startsWith("drop @ ")
     let dropUsr = userPrompt(sim, 0, "", "Ply 1 of at most 160.")
-    check "Example: {\"move\": " & $(%dropLegal) & "}" in dropUsr
+    check $(%*{"move": dropLegal}) in dropUsr
     check dropLegal in dropUsr
