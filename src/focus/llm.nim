@@ -496,12 +496,6 @@ proc completeText(client: LlmClient, system, user: string, slot: int,
     client.lastFailureCause = "model_rejection"
     raise newException(FocusError, "anthropic refusal (" &
       formatCompletionMeta(result) & ")")
-  if result.stopReason == "max_tokens" and '{' notin result.text:
-    client.lastFailureCause = "model_rejection"
-    raise newException(FocusError, "reply cut off at max_tokens before " &
-      "any JSON (" & formatCompletionMeta(result) & "): " &
-      quoteHead(result.text))
-
 proc cleanSay*(text: string): string =
   result = text.strip()
   if result.len <= MaxSayLen:
@@ -598,7 +592,8 @@ proc decide*(
       client.lastFailureCause = "provider"
     let detail =
       if hasCompletion and client.lastFailureCause == "model_rejection":
-        error.msg & " (" & formatCompletionMeta(completion) & ")"
+        (if completion.stopReason == "max_tokens": "response cut off at max_tokens: " else: "") &
+          error.msg & " (" & formatCompletionMeta(completion) & ")"
       else:
         error.msg
     if capture and client.nativeAttempts.len > 0:
