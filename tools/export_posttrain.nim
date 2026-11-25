@@ -54,15 +54,7 @@ when isMainModule:
     while not sim.done:
       let seat = sim.turn
       let teacher = client.scriptedAction(sim, seat)
-      var completion = %*{"say": teacher.say}
-      if teacher.move.kind == mkPlace:
-        completion["place"] = %cellName(teacher.move.toCell)
-      else:
-        completion["move"] = %*{
-          "from": cellName(teacher.move.fromCell),
-          "count": teacher.move.count,
-          "dir": $teacher.move.dir
-        }
+      let completion = decisionJson(teacher)
       let parsed = parseDecision(sim, seat, completion)
       doAssert parsed == teacher
       let system = systemPrompt(sim, seat, wording)
@@ -80,7 +72,7 @@ when isMainModule:
         "completion": [{"role": "assistant", "content": $completion}],
         "game": "focus",
         "prompt_template": wording.promptMetadata(system, user),
-        "action_schema_revision": "focus-move-v1"
+        "action_schema_revision": "focus-move-v2"
       }))
       sim.recordSay(seat, parsed.say)
       sim.applyMove(seat, parsed.move)

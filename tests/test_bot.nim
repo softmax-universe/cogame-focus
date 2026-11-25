@@ -2,7 +2,7 @@
 ## illegal move — it is a fieldable policy (PLAYER_SCRIPTED=1). Model replies
 ## must parse strictly with no compatibility shims or silent fallbacks.
 
-import std/[json, monotimes, os, times, unittest]
+import std/[json, monotimes, os, strutils, times, unittest]
 import focus/[llm, sim, prompts]
 
 proc fixture(seed: int, maxPlies = 160): GameConfig =
@@ -111,62 +111,97 @@ suite "scripted baseline":
       "http://127.0.0.1:9999/model/us.anthropic.claude-haiku-4-5-20251001-v1:0/invoke"
 
   test "extractJsonObject accepts bare or single-fenced JSON objects only":
-    let bare = extractJsonObject("""{"say":"hi","move":{"from":"c7","count":1,"dir":"E"}}""")
-    check bare["move"]["from"].getStr() == "c7"
-    let fencedJson = extractJsonObject("```json\n{\"place\":\"a4\"}\n```")
-    check fencedJson["place"].getStr() == "a4"
-    let fencedPlain = extractJsonObject("  ```\n{\"place\":\"a4\"}\n```  ")
-    check fencedPlain["place"].getStr() == "a4"
-    let fencedCrlf = extractJsonObject("```JSON\r\n{\"place\":\"a4\"}\r\n```")
-    check fencedCrlf["place"].getStr() == "a4"
+    let bare = extractJsonObject("""{"say":"hi","move":"c7 x1 E -> d7"}""")
+    check bare["move"].getStr() == "c7 x1 E -> d7"
+    let fencedJson = extractJsonObject("```json\n{\"move\":\"drop @ a4\"}\n```")
+    check fencedJson["move"].getStr() == "drop @ a4"
+    let fencedPlain = extractJsonObject("  ```\n{\"move\":\"drop @ a4\"}\n```  ")
+    check fencedPlain["move"].getStr() == "drop @ a4"
+    let fencedCrlf = extractJsonObject("```JSON\r\n{\"move\":\"drop @ a4\"}\r\n```")
+    check fencedCrlf["move"].getStr() == "drop @ a4"
     for bad in [
       "",
-      "Sure, here is my move: {\"place\":\"a4\"}",
-      "{\"place\":\"a4\"} good luck",
-      "Here:\n```json\n{\"place\":\"a4\"}\n```",
-      "```json\n{\"place\":\"a4\"}\n```\nThanks",
-      "{\"place\":\"a4\"} {\"place\":\"b4\"}",
-      "```json\n{\"place\":\"a4\"}\n```\n```json\n{\"place\":\"b4\"}\n```",
-      "```python\n{\"place\":\"a4\"}\n```",
-      "```json {\"place\":\"a4\"}```",
+      "Sure, here is my move: {\"move\":\"drop @ a4\"}",
+      "{\"move\":\"drop @ a4\"} good luck",
+      "Here:\n```json\n{\"move\":\"drop @ a4\"}\n```",
+      "```json\n{\"move\":\"drop @ a4\"}\n```\nThanks",
+      "{\"move\":\"drop @ a4\"} {\"move\":\"drop @ b4\"}",
+      "```json\n{\"move\":\"drop @ a4\"}\n```\n```json\n{\"move\":\"drop @ b4\"}\n```",
+      "```python\n{\"move\":\"drop @ a4\"}\n```",
+      "```json {\"move\":\"drop @ a4\"}```",
       "[1, 2, 3]"
     ]:
       expect FocusError:
         discard extractJsonObject(bad)
 
-  test "model replies parse strictly into moves and drops":
+  test "model replies parse strictly into canonical moveText IDs across move and drop phases":
     let config = fixture(0)
     var sim = initSim(config)
     let moved = parseDecision(sim, 0, parseJson(
-      """{"say":"hi","move":{"from":"c7","count":1,"dir":"E"}}"""))
+      """{"say":"hi","move":"c7 x1 E -> d7"}"""))
     check moved.move.kind == mkMove
     check moved.move.fromCell == parseCell("c7")
     check moved.move.toCell == parseCell("d7")
     check moved.say == "hi"
+    check decisionJson(moved) == %*{"move": "c7 x1 E -> d7", "say": "hi"}
     sim.applyMove(0, moved.move)
     let noSay = parseDecision(sim, 1, parseJson(
-      """{"move":{"from":"b6","count":1,"dir":"N"}}"""))
+      """{"move":"b6 x1 N -> b7"}"""))
     check noSay.say == ""
     check noSay.move.dir == dirN
+    check decisionJson(noSay) == %*{"move": "b6 x1 N -> b7"}
+    sim.applyMove(1, noSay.move)
+    ## Multi-piece stack carry (d7 has height 2 controlled by seat 0).
+    let stacked = parseDecision(sim, 0, parseJson(
+      """{"move":"d7 x2 E -> f7"}"""))
+    check stacked.move.kind == mkMove
+    check stacked.move.count == 2
+    check stacked.move.toCell == parseCell("f7")
+    sim.applyMove(0, stacked.move)
+    ## Drop phase: reserve drop only legal when seat has reserve > 0.
+    expect FocusError:
+      discard parseDecision(sim, 1, parseJson("""{"move":"drop @ a4"}"""))
+    sim.reserve[1] = 1
     let dropped = parseDecision(sim, 1, parseJson(
-      """{"say":"","place":"a4"}"""))
+      """{"say":"","move":"drop @ a4"}"""))
     check dropped.move.kind == mkPlace
     check dropped.move.toCell == parseCell("a4")
+    check decisionJson(dropped) == %*{"move": "drop @ a4"}
     for bad in [
       """{"say":"?"}""",
-      """{"move":{"from":"a1","count":1,"dir":"N"}}""",
-      """{"move":{"place":"h5"}}""",
-      """{"place":{"to":"a4"}}""",
-      """{"move":{"from":"b6","count":"1","dir":"N"}}""",
-      """{"move":{"from":"b6","count":1,"direction":"N"}}""",
-      """{"move":{"from":"b6","count":1,"dir":"north"}}""",
-      """{"move":{"from":"B6","count":1,"dir":"N"}}""",
-      """{"move":{"from":"b6","dir":"N"}}""",
-      """{"move":{"from":"b6","count":0,"dir":"N"}}""",
-      """{"move":{"from":"b6","count":1,"dir":"N"},"place":"a4"}""",
-      """{"move":{"from":"b6","count":1,"dir":"N","extra":1}}""",
-      """{"move":{"from":"b6","count":1,"dir":"N"},"extra":1}""",
-      """{"say":123,"place":"a4"}"""
+      """{"move":"a1 x1 N -> a2"}""",
+      """{"move":"f7 x1 W -> e7"}""",
+      """{"move":"b6 x1 N → b7"}""",
+      """{"move":"b6 x1 N -> b7 "}""",
+      """{"move":"B6 x1 N -> b7"}""",
+      """{"move":"DROP @ a4"}""",
+      """{"move":{"from":"b6","count":1,"dir":"N"}}""",
+      """{"place":"a4"}""",
+      """{"move":"drop @ a4","place":"a4"}""",
+      """{"move":["drop @ a4","drop @ b4"]}""",
+      """{"moves":["drop @ a4"]}""",
+      """{"move":"drop @ a4","extra":1}""",
+      """{"say":123,"move":"drop @ a4"}"""
     ]:
       expect FocusError:
         discard parseDecision(sim, 1, parseJson(bad))
+
+  test "prompt lists exact legal moveText IDs and builds example from current legal move":
+    let config = fixture(0)
+    var sim = initSim(config)
+    let legalMove = moveText(sim.legalMoves(0)[0])
+    let sys = systemPrompt(sim, 0, PromptSelection())
+    let usr = userPrompt(sim, 0, "Play strong Focus.", "Ply 1 of at most 160.")
+    check "Bluff, needle, and mislead" notin sys
+    check "Example: {\"move\": " & $(%legalMove) & "}" in usr
+    check legalMove in usr
+    ## Drop-only position: example must be a legal drop ID.
+    for cell in 0 ..< Cells:
+      sim.board[cell] = @[]
+    sim.board[parseCell("d4")] = @[1]
+    sim.reserve[0] = 1
+    let dropLegal = moveText(sim.legalMoves(0)[0])
+    check dropLegal.startsWith("drop @ ")
+    let dropUsr = userPrompt(sim, 0, "", "Ply 1 of at most 160.")
+    check "Example: {\"move\": " & $(%dropLegal) & "}" in dropUsr
+    check dropLegal in dropUsr

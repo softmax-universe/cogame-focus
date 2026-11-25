@@ -55,11 +55,13 @@ and `heldout-reference` are evaluation-only.
 
 ## Collection
 
-The persistent bridge accepts `MANIFEST [VARIANT [text]]`. Text mode retains
-full move/drop actions and public speech through the production parser. Reset
-accepts `promptVariant`, `promptSeed`, and `split`; held-out training is rejected.
-Private metadata records exact message hashes, bank, wording, and seed.
-Numeric mode retains its 331 features and 1,344 action slots.
+The persistent bridge accepts `MANIFEST [VARIANT [text]]`. Both native prompt
+replies and bridge/export actions use the unified `{"move": "<exact moveText ID>"}`
+schema (with optional `"say"`). Text mode retains full move/drop IDs and optional
+public speech through the production parser. Reset accepts `promptVariant`,
+`promptSeed`, and `split`; held-out training is rejected. Private metadata
+records exact message hashes, bank, wording, and seed. Numeric mode retains its
+331 features and 1,344 action slots.
 
 Export complete teacher games from a clean committed checkout:
 

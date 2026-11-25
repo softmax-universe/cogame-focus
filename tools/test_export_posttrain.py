@@ -1,6 +1,7 @@
 """Check complete seeded mixed-wording exports for complete Focus games."""
 
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -51,11 +52,14 @@ if __name__ == "__main__":
                         "user",
                     ]
                     action = json.loads(row["completion"][0]["content"])
-                    assert ("move" in action) != ("place" in action)
-                    if "move" in action:
-                        assert 1 <= action["move"]["count"] <= 5
-                        assert action["move"]["dir"] in {"N", "S", "E", "W"}
-                    assert len(action["say"].encode()) <= 160
+                    assert "move" in action and "place" not in action
+                    assert isinstance(action["move"], str)
+                    assert re.fullmatch(
+                        r"([a-h][1-8] x[1-5] [NSEW] -> [a-h][1-8]|drop @ [a-h][1-8])",
+                        action["move"],
+                    ), f"unexpected move ID: {action['move']!r}"
+                    assert len(action.get("say", "").encode()) <= 160
+                    assert row["action_schema_revision"] == "focus-move-v2"
                     assert row["prompt_template"]["variant"] not in (
                         "heldout-briefing",
                         "heldout-reference",

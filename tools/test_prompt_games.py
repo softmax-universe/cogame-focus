@@ -65,11 +65,12 @@ def play(seed, wording="canonical", prompt_seed=0, speech=False):
                     == hashlib.sha256(message["content"].encode()).hexdigest()
                 )
             teacher = json.loads(request({"kind": "teacher"})["response"])
+            assert isinstance(teacher["move"], str)
             if speech:
                 teacher["say"] = "  PUBLIC-TALK-" + "x" * 200 + "  "
             else:
-                teacher["say"] = ""
-            if "place" in teacher:
+                teacher.pop("say", None)
+            if teacher["move"].startswith("drop @ "):
                 drops += 1
             raw_response = json.dumps(teacher)
             if speech and index % 3 == 1:
@@ -81,17 +82,14 @@ def play(seed, wording="canonical", prompt_seed=0, speech=False):
             )
             assert result["kind"] == "accepted"
             action = result["action"]
+            assert isinstance(action["move"], str)
             if speech:
                 assert (
                     action["say"].startswith("PUBLIC-TALK-")
                     and len(action["say"].encode()) <= 160
                 )
-                if "move" in action:
-                    assert isinstance(action["move"]["count"], int) and action["move"][
-                        "dir"
-                    ] in ("N", "S", "E", "W")
-                else:
-                    assert isinstance(action["place"], str)
+            else:
+                assert "say" not in action
             trace.append((view, messages[1]["content"]))
             observation = result["observation"]
         assert 1 <= len(trace) <= 120 and sum(observation["scores"].values()) == 1
@@ -121,13 +119,14 @@ print(
     flush=True,
 )
 for bad_response in (
-    'Sure: {"say":"","move":{"from":"c7","count":1,"dir":"E"}}',
-    '{"say":"","move":{"from":"c7","count":"1","dir":"E"}}',
-    '{"say":"","move":{"from":"c7","count":1,"direction":"E"}}',
-    '{"say":"","move":{"from":"c7","count":1,"dir":"east"}}',
-    '{"say":"","move":{"from":"c7","dir":"E"}}',
-    '{"say":"","place":{"to":"a4"}}',
-    '{"say":"","move":{"place":"a4"}}',
+    'Sure: {"move":"c7 x1 E -> d7"}',
+    '{"move":{"from":"c7","count":1,"dir":"E"}}',
+    '{"place":"a4"}',
+    '{"move":"c7 x1 E -> d7","place":"a4"}',
+    '{"move":"c7 x1 E -> d7"} {"move":"b7 x1 E -> c7"}',
+    '{"move":"c7 x1 E → d7"}',
+    '{"move":["c7 x1 E -> d7","b7 x1 E -> c7"]}',
+    '{"move":"a1 x1 N -> a2"}',
 ):
     reset_line = json.dumps(
         {

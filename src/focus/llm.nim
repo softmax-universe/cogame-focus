@@ -89,6 +89,7 @@ proc newLlmClient*(config: GameConfig): LlmClient =
       if sidecarModel.len > 0: sidecarModel
       else: "anthropic/claude-haiku-4.5"
     result.curl = newCurly()
+    echo "focus llm: sidecar transport, model ", result.model
     return
   let bedrockEndpoint = getEnv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME").strip()
   let bedrockToken = getEnv("AWS_BEARER_TOKEN_BEDROCK").strip()
@@ -286,9 +287,9 @@ proc renderHistory(sim: Sim): string =
     lines = @["(earlier moves omitted)"] & lines[^24 .. ^1]
   lines.join("\n")
 
-proc renderLegalMoves(sim: Sim, seat: int): string =
-  ## Per controlled stack: "e4 (h3): 1N e5, 1E f4, 2N e6, ..."; then the
-  ## drop option.
+proc renderLegalMoves*(sim: Sim, seat: int): string =
+  ## Exact canonical moveText IDs for every legal move, grouped cleanly so
+  ## every comma-separated item is a copyable legal move ID.
   var lines: seq[string]
   for cell in 0 ..< Cells:
     if not sim.controls(seat, cell):
@@ -299,43 +300,51 @@ proc renderLegalMoves(sim: Sim, seat: int): string =
       for dir in Direction:
         let dest = step(cell, dir, count)
         if dest >= 0:
-          options.add($count & $dir & " " & cellName(dest))
-    lines.add(cellName(cell) & " (h" & $height & "): " & options.join(", "))
+          options.add(moveText(Move(kind: mkMove, fromCell: cell,
+            toCell: dest, count: count, dir: dir)))
+    if options.len > 0:
+      lines.add(options.join(", "))
   if sim.reserve[seat] > 0:
-    lines.add("DROP: place one of your " & $sim.reserve[seat] &
-      " reserve pieces on any playable square (it goes on top).")
+    var drops: seq[string]
+    for cell in 0 ..< Cells:
+      if validCell(cell):
+        drops.add(moveText(Move(kind: mkPlace, fromCell: -1, toCell: cell)))
+        if drops.len == 8:
+          lines.add(drops.join(", "))
+          drops.setLen(0)
+    if drops.len > 0:
+      lines.add(drops.join(", "))
   lines.join("\n")
 
 const BoardRules = "Rules:\n- 8x8 board with the three squares in each corner missing (a1 b1 a2, g1 h1\n  h2, a8 b8 a7, g8 h8 h7 are NOT playable). Files a-h, ranks 1-8; N is\n  toward rank 8, E toward file h.\n"
-const CanonicalPlayRules = "- Pieces stack. Whoever owns the TOP piece controls the stack.\n- On your turn, MOVE: take the top k pieces (1..height) of a stack you\n  control and move them exactly k squares in one direction (N/S/E/W),\n  jumping over anything, landing on top of whatever is there. The pieces\n  you carry may include enemy pieces underneath your top piece.\n- If a stack ends taller than 5, pieces come off the BOTTOM: your own go\n  to your reserve, enemy pieces are captured for good.\n- Or DROP: instead of moving, place one reserve piece on top of any\n  playable square.\n- A player who cannot move (controls no stack, no reserve) LOSES. At the\n  ply cap the side with more material (pieces in stacks it controls plus\n  reserve) wins.\n- Table talk is heard by everyone. Bluff, needle, and mislead freely.\n"
+const CanonicalPlayRules = "- Pieces stack. Whoever owns the TOP piece controls the stack.\n- On your turn, MOVE: take the top k pieces (1..height) of a stack you\n  control and move them exactly k squares in one direction (N/S/E/W),\n  jumping over anything, landing on top of whatever is there. The pieces\n  you carry may include enemy pieces underneath your top piece.\n- If a stack ends taller than 5, pieces come off the BOTTOM: your own go\n  to your reserve, enemy pieces are captured for good.\n- Or DROP: instead of moving, place one reserve piece on top of any\n  playable square.\n- A player who cannot move (controls no stack, no reserve) LOSES. At the\n  ply cap the side with more material (pieces in stacks it controls plus\n  reserve) wins.\n- Optional public \"say\" text may be included inside the JSON reply.\n"
 const RulesText* = BoardRules & CanonicalPlayRules
 
 proc systemPrompt*(sim: Sim, seat: int, selection: PromptSelection): string =
   let playRules = case selection.selectedVariant
     of pvCanonical: CanonicalPlayRules
-    of pvPlain: "Stacks belong to whoever owns their top piece. To MOVE, take the top k pieces of a controlled stack (1 through its height) and travel exactly k squares N, S, E, or W. Jump over intervening pieces and land on top of the destination; enemy pieces below your top piece may travel with you. Trim any stack taller than five from its bottom: return your own pieces to reserve and permanently capture enemy pieces. Alternatively DROP one reserve piece onto any playable square. Having no controlled stack and no reserve means no move and a loss. At the ply cap, more material wins: pieces in controlled stacks plus reserve. Everyone hears table talk; bluffing, needling, and misleading are allowed.\n"
-    of pvNumbered: "1. Control a stack by owning its top piece.\n2. MOVE the top k pieces, 1..height, from a controlled stack exactly k squares N/S/E/W. Jump intervening pieces and land on the destination stack; carried lower pieces may belong to the enemy.\n3. Trim stacks above five from the bottom: own pieces to reserve, enemy pieces permanently captured.\n4. Instead of moving, DROP one reserve piece on any playable square.\n5. No controlled stacks and no reserve means no move and a loss. At the ply cap, compare controlled-stack pieces plus reserve; more wins.\n6. Everyone hears table talk. Bluff, needle, and mislead freely.\n"
-    of pvQuestions: "Who controls a stack? The owner of its top piece. How do you MOVE? Take its top k pieces, 1..height, and jump exactly k squares N/S/E/W onto the destination; lower enemy pieces travel too. What if the stack exceeds five? Remove bottom pieces: yours enter reserve, enemies are captured permanently. What is the alternative? DROP one reserve piece on any playable square. How do you lose? No controlled stack and no reserve leaves no move. How does the ply cap settle? More pieces in controlled stacks plus reserve wins. Who hears talk? Everyone; bluffing, needling, and misleading are allowed.\n"
-    of pvReordered: "Win by leaving the opponent unable to move: no controlled stack and no reserve. At the ply cap, more material (pieces in controlled stacks plus reserve) wins. A stack is controlled by its top piece's owner. Either DROP one reserve piece onto any playable square or MOVE the top k pieces of a controlled stack exactly k squares N/S/E/W, with 1 <= k <= height. Jump over intervening pieces, land on top, and carry lower enemy pieces along. Remove excess above five from the bottom: own pieces return to reserve, enemy pieces are captured permanently. Table talk is public; bluff, needle, and mislead freely.\n"
-    of pvHeldoutBriefing: "Control follows the top piece of each stack. On a move, carry the top k pieces of one you control exactly k squares along a cardinal direction, for any k from one to its height. You jump intervening pieces and land above the destination stack; enemy pieces below your top piece can accompany you. A stack over five sheds bottom pieces, sending yours to reserve and capturing enemy pieces permanently. You may instead drop one reserve piece on any playable square. Losing all controlled stacks and reserves leaves no move and loses. The ply cap awards the win to greater controlled-stack material plus reserve. All table talk is public, including bluffs, needling, and deception.\n"
-    of pvHeldoutReference: "Control: top-piece owner. MOVE: top k pieces of a controlled stack, k in 1..height, exactly k squares N/S/E/W; jump intervening pieces, land atop destination, carry any lower enemy pieces too. Overflow: trim above five from bottom; own pieces to reserve, enemy pieces permanently captured. DROP alternative: one reserve piece onto any playable square. Loss: no controlled stack and no reserve, hence no move. Ply-cap winner: greater controlled-stack piece count plus reserve. Talk: public; bluffing, needling, and misleading allowed.\n"
+    of pvPlain: "Stacks belong to whoever owns their top piece. To MOVE, take the top k pieces of a controlled stack (1 through its height) and travel exactly k squares N, S, E, or W. Jump over intervening pieces and land on top of the destination; enemy pieces below your top piece may travel with you. Trim any stack taller than five from its bottom: return your own pieces to reserve and permanently capture enemy pieces. Alternatively DROP one reserve piece onto any playable square. Having no controlled stack and no reserve means no move and a loss. At the ply cap, more material wins: pieces in controlled stacks plus reserve. An optional public \"say\" field may be included in the JSON reply.\n"
+    of pvNumbered: "1. Control a stack by owning its top piece.\n2. MOVE the top k pieces, 1..height, from a controlled stack exactly k squares N/S/E/W. Jump intervening pieces and land on the destination stack; carried lower pieces may belong to the enemy.\n3. Trim stacks above five from the bottom: own pieces to reserve, enemy pieces permanently captured.\n4. Instead of moving, DROP one reserve piece on any playable square.\n5. No controlled stacks and no reserve means no move and a loss. At the ply cap, compare controlled-stack pieces plus reserve; more wins.\n6. Optional public \"say\" text may be placed in the JSON reply.\n"
+    of pvQuestions: "Who controls a stack? The owner of its top piece. How do you MOVE? Take its top k pieces, 1..height, and jump exactly k squares N/S/E/W onto the destination; lower enemy pieces travel too. What if the stack exceeds five? Remove bottom pieces: yours enter reserve, enemies are captured permanently. What is the alternative? DROP one reserve piece on any playable square. How do you lose? No controlled stack and no reserve leaves no move. How does the ply cap settle? More pieces in controlled stacks plus reserve wins. Can you speak? Optionally via the JSON \"say\" field.\n"
+    of pvReordered: "Win by leaving the opponent unable to move: no controlled stack and no reserve. At the ply cap, more material (pieces in controlled stacks plus reserve) wins. A stack is controlled by its top piece's owner. Either DROP one reserve piece onto any playable square or MOVE the top k pieces of a controlled stack exactly k squares N/S/E/W, with 1 <= k <= height. Jump over intervening pieces, land on top, and carry lower enemy pieces along. Remove excess above five from the bottom: own pieces return to reserve, enemy pieces are captured permanently. Optional public speech belongs only in the JSON \"say\" field.\n"
+    of pvHeldoutBriefing: "Control follows the top piece of each stack. On a move, carry the top k pieces of one you control exactly k squares along a cardinal direction, for any k from one to its height. You jump intervening pieces and land above the destination stack; enemy pieces below your top piece can accompany you. A stack over five sheds bottom pieces, sending yours to reserve and capturing enemy pieces permanently. You may instead drop one reserve piece on any playable square. Losing all controlled stacks and reserves leaves no move and loses. The ply cap awards the win to greater controlled-stack material plus reserve. Any optional public message goes in the JSON \"say\" field.\n"
+    of pvHeldoutReference: "Control: top-piece owner. MOVE: top k pieces of a controlled stack, k in 1..height, exactly k squares N/S/E/W; jump intervening pieces, land atop destination, carry any lower enemy pieces too. Overflow: trim above five from bottom; own pieces to reserve, enemy pieces permanently captured. DROP alternative: one reserve piece onto any playable square. Loss: no controlled stack and no reserve, hence no move. Ply-cap winner: greater controlled-stack piece count plus reserve. Optional speech: JSON \"say\" field only.\n"
     of pvMixed: raise newException(ValueError, "mixed selection must resolve to a training wording")
   let me = sim.seatName(seat)
   let them = sim.seatName(1 - seat)
   selection.introduction(me, them) & "\n\n" & BoardRules & playRules & """
 
-OUTPUT FORMAT: reply with ONLY one JSON object (bare or inside a single
-ordinary Markdown code fence), with no other text before or after it.
-Decide silently; put any table talk in the optional "say" field."""
+OUTPUT FORMAT: Reply with ONLY one JSON object (bare or inside a single
+ordinary Markdown code fence) of the form {"move": "<exact legal move ID>"},
+with an optional "say" string (max 160 chars). Output no analysis or other
+text outside the JSON object."""
 
 proc actionInstruction(sim: Sim, seat: int): string =
-  "It is your turn. Pick exactly one LEGAL option from the list above, " &
-    "with an optional short \"say\" line to the table (max " & $MaxSayLen &
-    " chars).\n" &
-    "Reply with ONLY one JSON object: " &
-    "{\"say\": \"...\", \"move\": {\"from\": \"e4\", " &
-    "\"count\": 2, \"dir\": \"N\"}} to move, or {\"say\": \"...\", " &
-    "\"place\": \"e4\"} to drop a reserve piece."
+  let legal = sim.legalMoves(seat)
+  let example = if legal.len > 0: moveText(legal[0]) else: "drop @ c1"
+  "Reply with ONLY one JSON object copying one exact legal move ID from the " &
+    "list above (optional \"say\" string, max " & $MaxSayLen & " chars), " &
+    "with no analysis or extra text. Example: {\"move\": " & $(%example) & "}"
 
 proc userPrompt*(sim: Sim, seat: int, prompt: string, header: string): string =
   if header.len > 0:
@@ -391,8 +400,23 @@ proc extractJsonObject*(text: string): JsonNode =
   if result.kind != JObject:
     raise newException(FocusError, "response must be a JSON object: " & quoteHead(text))
 
+type
+  CompletionResult = object
+    text: string
+    stopReason: string
+    outputTokens: Option[int]
+    blockTypes: seq[string]
+
+proc formatCompletionMeta(meta: CompletionResult): string =
+  let stop = if meta.stopReason.len > 0: meta.stopReason else: "unknown"
+  let tokens =
+    if meta.outputTokens.isSome: $meta.outputTokens.get()
+    else: "unknown"
+  "stop_reason=" & stop & ", output_tokens=" & tokens &
+    ", blocks=[" & meta.blockTypes.join(",") & "]"
+
 proc completeText(client: LlmClient, system, user: string, slot: int,
-    policy: string, ply: int): string =
+    policy: string, ply: int): CompletionResult =
   var body = %*{
     "max_tokens": client.maxOutputTokens,
     "system": system,
@@ -460,16 +484,25 @@ proc completeText(client: LlmClient, system, user: string, slot: int,
   if payload.kind != JObject or not payload.hasKey("content") or payload["content"].kind != JArray:
     client.lastFailureCause = "provider"
     raise newException(FocusError, "invalid provider payload: missing content array")
-  if payload{"stop_reason"}.getStr() == "refusal":
-    client.lastFailureCause = "model_rejection"
-    raise newException(FocusError, "anthropic refusal")
+  result.stopReason = payload{"stop_reason"}.getStr()
+  let usage = payload{"usage"}
+  if not usage.isNil and usage.kind == JObject and
+      usage.hasKey("output_tokens") and usage["output_tokens"].kind == JInt:
+    result.outputTokens = some(usage["output_tokens"].getInt())
   for contentBlock in payload["content"]:
-    if contentBlock{"type"}.getStr() == "text":
-      result.add(contentBlock{"text"}.getStr())
-  if payload{"stop_reason"}.getStr() == "max_tokens" and '{' notin result:
+    let blockType = contentBlock{"type"}.getStr("unknown")
+    result.blockTypes.add(blockType)
+    if blockType == "text":
+      result.text.add(contentBlock{"text"}.getStr())
+  if result.stopReason == "refusal":
+    client.lastFailureCause = "model_rejection"
+    raise newException(FocusError, "anthropic refusal (" &
+      formatCompletionMeta(result) & ")")
+  if result.stopReason == "max_tokens" and '{' notin result.text:
     client.lastFailureCause = "model_rejection"
     raise newException(FocusError, "reply cut off at max_tokens before " &
-      "any JSON: " & result[0 .. min(result.high, 160)].replace("\n", " "))
+      "any JSON (" & formatCompletionMeta(result) & "): " &
+      quoteHead(result.text))
 
 proc cleanSay*(text: string): string =
   result = text.strip()
@@ -485,56 +518,34 @@ proc cleanSay*(text: string): string =
     result.setLen(space)
   result.add("…")
 
+proc parseMoveId*(sim: Sim, seat: int, moveId: string): Move =
+  ## Matches `moveId` against the exact canonical moveText IDs for `seat`'s
+  ## legal moves. No fuzzy matching, no alternate wire formats.
+  for move in sim.legalMoves(seat):
+    if moveText(move) == moveId:
+      return move
+  raise newException(FocusError, "illegal move: " & moveId)
+
 proc parseDecision*(sim: Sim, seat: int, payload: JsonNode): Decision =
-  ## Maps the model's JSON onto a Move (legality is checked by applyMove).
+  ## Maps {"move": "<exact legal moveText ID>", "say": "..." (optional)} onto
+  ## a legal Move for `seat`.
   if payload.isNil or payload.kind != JObject:
     raise newException(FocusError, "response must be a JSON object")
   for key in payload.keys:
-    if key notin ["say", "move", "place"]:
+    if key notin ["move", "say"]:
       raise newException(FocusError, "unexpected field in response: " & key)
   if payload.hasKey("say") and payload["say"].kind != JNull:
     if payload["say"].kind != JString:
       raise newException(FocusError, "say must be a string")
     result.say = cleanSay(payload["say"].getStr())
-  let hasPlace = payload.hasKey("place") and payload["place"].kind != JNull
-  let hasMove = payload.hasKey("move") and payload["move"].kind != JNull
-  if hasPlace and hasMove:
-    raise newException(FocusError, "response cannot include both move and place")
-  if not hasPlace and not hasMove:
-    raise newException(FocusError, "no move or place in response")
-  if hasPlace:
-    let target = payload["place"]
-    if target.kind != JString:
-      raise newException(FocusError, "place must be a square string")
-    result.move = Move(kind: mkPlace, fromCell: -1, toCell: parseCell(target.getStr()))
-    return
-  let move = payload["move"]
-  if move.kind != JObject:
-    raise newException(FocusError, "move must be a JSON object")
-  for key in move.keys:
-    if key notin ["from", "count", "dir"]:
-      raise newException(FocusError, "unexpected field in move: " & key)
-  if not move.hasKey("from") or move["from"].kind != JString:
-    raise newException(FocusError, "move.from must be a square string")
-  if not move.hasKey("count") or move["count"].kind != JInt:
-    raise newException(FocusError, "move.count must be an integer")
-  if not move.hasKey("dir") or move["dir"].kind != JString:
-    raise newException(FocusError, "move.dir must be a direction string")
-  let fromCell = parseCell(move["from"].getStr())
-  let count = move["count"].getInt()
-  if count < 1:
-    raise newException(FocusError, "move.count must be positive")
-  let dir = parseDirection(move["dir"].getStr())
-  result.move = Move(kind: mkMove, fromCell: fromCell,
-    toCell: step(fromCell, dir, count), count: count, dir: dir)
+  if not payload.hasKey("move") or payload["move"].kind != JString:
+    raise newException(FocusError, "move must be a legal move ID string")
+  result.move = sim.parseMoveId(seat, payload["move"].getStr())
 
 proc decisionJson*(decision: Decision): JsonNode =
-  result = %*{"say": decision.say}
-  if decision.move.kind == mkPlace:
-    result["place"] = %cellName(decision.move.toCell)
-  else:
-    result["move"] = %*{"from": cellName(decision.move.fromCell),
-      "count": decision.move.count, "dir": $decision.move.dir}
+  result = %*{"move": moveText(decision.move)}
+  if decision.say.len > 0:
+    result["say"] = %decision.say
 
 proc decide*(
   client: LlmClient,
@@ -561,11 +572,14 @@ proc decide*(
       else: "LLM transport disabled")
   let system = systemPrompt(sim, seat, selection)
   let user = userPrompt(sim, seat, prompt, header)
+  var completion: CompletionResult
+  var hasCompletion = false
   try:
-    let rawText = client.completeText(system, user, seat,
+    completion = client.completeText(system, user, seat,
       sim.config.players[seat].name, sim.ply)
+    hasCompletion = true
     client.lastFailureCause = "model_rejection"
-    let payload = extractJsonObject(rawText)
+    let payload = extractJsonObject(completion.text)
     let decision = parseDecision(sim, seat, payload)
     var probe = sim
     probe.applyMove(seat, decision.move)
@@ -584,8 +598,13 @@ proc decide*(
   except CatchableError as error:
     if client.lastFailureCause.len == 0:
       client.lastFailureCause = "provider"
+    let detail =
+      if hasCompletion and client.lastFailureCause == "model_rejection":
+        error.msg & " (" & formatCompletionMeta(completion) & ")"
+      else:
+        error.msg
     if capture and client.nativeAttempts.len > 0:
       client.nativeAttempts[^1].accepted = false
-      client.nativeAttempts[^1].rejectionReason = some(error.msg)
-    echo "focus llm: seat ", seat, " failed: ", error.msg
-    raise newException(FocusError, "model decision failed: " & error.msg)
+      client.nativeAttempts[^1].rejectionReason = some(detail)
+    echo "focus llm: seat ", seat, " failed: ", detail
+    raise newException(FocusError, "model decision failed: " & detail)
