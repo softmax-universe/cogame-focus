@@ -33,6 +33,9 @@ import
 const
   MaxPromptLen = 4000
   ReplayVersion = 1
+  CogamePlayerFailureUriEnv = "COGAME_PLAYER_FAILURE_URI"
+  CogamePlayerFailureMethodEnv = "COGAME_PLAYER_FAILURE_METHOD"
+  MaxFailureMessageLen = 2000
 
 type
   GameState = object
@@ -226,14 +229,40 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
   echo "focus: episode complete, shutting down"
   quit(0)
 
-proc failEpisode(runtimeConfig: RuntimeConfig, seat: int, cause, detail: string) =
+proc playerFailureMessage*(cause, detail: string): string =
+  result = detail.strip()
+  if result.len == 0:
+    result = cause.strip()
+  if result.len == 0:
+    result = "player failure"
+  if result.len > MaxFailureMessageLen:
+    result = result[0 ..< MaxFailureMessageLen]
+    while result.len > 0 and (result[^1].ord and 0xC0) == 0x80:
+      result.setLen(result.len - 1)
+    if result.len == 0:
+      result = "player failure"
+
+proc playerFailureJson*(seat: int, cause, detail, kind: string): JsonNode =
+  let normalizedKind =
+    if kind == "episode_inconclusive": "episode_inconclusive"
+    else: "player_error"
+  %*{
+    "failed_policy_index": seat,
+    "message": playerFailureMessage(cause, detail),
+    "kind": normalizedKind
+  }
+
+proc failEpisode(runtimeConfig: RuntimeConfig, seat: int, cause, detail: string,
+    failureKind = "player_error") =
   var replayData: string
   var ply: int
+  var seatCount: int
   withLock stateLock:
     if state.finished:
       return
     state.finished = true
     ply = state.sim.ply
+    seatCount = state.config.players.len
     let failure = %*{
       "status": "failed",
       "cause": cause,
@@ -261,8 +290,8 @@ proc failEpisode(runtimeConfig: RuntimeConfig, seat: int, cause, detail: string)
       except CatchableError:
         discard
 
-  echo "focus: episode failed (cause=", cause, ", seat=", seat,
-    ", ply=", ply, "): ", detail
+  echo "focus: episode failed (cause=", cause, ", kind=", failureKind,
+    ", seat=", seat, ", ply=", ply, "): ", detail
   if runtimeConfig.replayUri.len > 0:
     try:
       echo "focus: writing partial replay diagnostics (no official results)"
@@ -272,6 +301,17 @@ proc failEpisode(runtimeConfig: RuntimeConfig, seat: int, cause, detail: string)
       )
     except CatchableError as error:
       echo "focus: failed to write partial replay: ", error.msg
+  let playerFailureUri = getEnv(CogamePlayerFailureUriEnv).strip()
+  if playerFailureUri.len > 0 and seat >= 0 and seat < seatCount:
+    try:
+      writeArtifact(
+        playerFailureUri,
+        $playerFailureJson(seat, cause, detail, failureKind),
+        "application/json",
+        CogamePlayerFailureMethodEnv
+      )
+    except CatchableError as error:
+      echo "focus: failed to write player failure artifact: ", error.msg
   sleep(200)
   quit(1)
 
@@ -458,11 +498,14 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         let status =
           if cause == "model_rejection": asRejected
           else: asMissing
+        let failureKind =
+          if cause == "model_rejection": "player_error"
+          else: "episode_inconclusive"
         withLock stateLock:
           if not state.trajectory.isNil:
             state.trajectory.recordRejectedDecision(state.selection, simCopy.ply, seat,
               config.players[seat].name, captureView, client.nativeAttempts, status)
-        failEpisode(runtimeConfig, seat, cause, decideError)
+        failEpisode(runtimeConfig, seat, cause, decideError, failureKind)
 
       var applyError = ""
       withLock stateLock:

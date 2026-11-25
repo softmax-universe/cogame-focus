@@ -43,7 +43,7 @@ def make_provider(state, fail_ply=None, fail_mode="model_rejection", transport="
             legal_ids = [item.strip() for line in legal.splitlines() for item in line.split(",") if item.strip()]
             assert legal_ids, "missing legal move IDs in prompt"
             move_id = legal_ids[0]
-            assert f'Example: {{"move": "{move_id}"}}' in user
+            assert f'{{"move":"{move_id}"}}' in user
             action = {"move": move_id}
             if ply != 1:
                 action["say"] = "hello"
@@ -260,6 +260,7 @@ def run(
         COGAME_PORT=str(port),
         COGAME_CONFIG_URI=(root / "config.json").as_uri(),
         COGAME_RESULTS_URI=(root / "results.json").as_uri(),
+        COGAME_PLAYER_FAILURE_URI=(root / "player_failure.json").as_uri(),
         COGAME_SAVE_REPLAY_URI=(root / "replay.json").as_uri(),
         COGAME_SAVE_TRAJECTORY_URI=(root / "trajectory.jsonl").as_uri(),
         COWORLD_EPISODE_ID=episode,
@@ -355,6 +356,16 @@ def run(
             assert replay["failure"]["cause"] == expected_cause
             assert replay["failure"]["ply"] == expected_ply
             assert not any(ev["kind"] == "end" for ev in replay["events"])
+            failure_path = root / "player_failure.json"
+            assert failure_path.exists(), f"missing player_failure.json on failure ({tag})"
+            player_failure = json.loads(failure_path.read_text())
+            assert set(player_failure.keys()) == {"failed_policy_index", "message", "kind"}
+            assert player_failure["failed_policy_index"] == replay["failure"]["seat"]
+            assert isinstance(player_failure["message"], str) and 1 <= len(player_failure["message"]) <= 2000
+            expected_kind = "player_error" if expected_cause == "model_rejection" else "episode_inconclusive"
+            assert player_failure["kind"] == expected_kind
+            if fail_ply is not None and fail_mode == "max_tokens_thinking":
+                assert "SECRET_COT_DO_NOT_LOG" not in player_failure["message"]
             if capture:
                 trace = root / "trajectory.jsonl"
                 rows = [json.loads(line) for line in trace.read_text().splitlines()]
@@ -380,6 +391,7 @@ def run(
                         assert last["attempts"][0]["http_status"] == expected_http
             return None, replay
         assert rc == 0
+        assert not (root / "player_failure.json").exists(), "successful episode must not emit player_failure.json"
         results = json.loads((root / "results.json").read_text())
         assert results["reason"] in ("cap", "no-moves")
         assert 1 <= results["plies"] <= config["maxPlies"]
@@ -476,6 +488,7 @@ def run_external_failure_test(game, player, output, variant, mode):
         COGAME_PORT=str(port),
         COGAME_CONFIG_URI=(root / "config.json").as_uri(),
         COGAME_RESULTS_URI=(root / "results.json").as_uri(),
+        COGAME_PLAYER_FAILURE_URI=(root / "player_failure.json").as_uri(),
         COGAME_SAVE_REPLAY_URI=(root / "replay.json").as_uri(),
         COGAME_SAVE_TRAJECTORY_URI=(root / "trajectory.jsonl").as_uri(),
         COWORLD_EPISODE_ID=f"focus-external-{mode}",
@@ -544,6 +557,13 @@ def run_external_failure_test(game, player, output, variant, mode):
         assert replay["failure"]["cause"] == expected_cause
         assert replay["failure"]["ply"] == 2
         assert not any(ev["kind"] == "end" for ev in replay["events"])
+        failure_path = root / "player_failure.json"
+        assert failure_path.exists(), f"missing player_failure.json on external {mode}"
+        player_failure = json.loads(failure_path.read_text())
+        assert set(player_failure.keys()) == {"failed_policy_index", "message", "kind"}
+        assert player_failure["failed_policy_index"] == 0
+        assert player_failure["kind"] == "player_error"
+        assert isinstance(player_failure["message"], str) and 1 <= len(player_failure["message"]) <= 2000
         rows = [json.loads(line) for line in (root / "trajectory.jsonl").read_text().splitlines()]
         assert rows[-1]["status"] == "failed"
         assert rows[-1]["outcome"]["cause"] == expected_cause
