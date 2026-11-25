@@ -23,6 +23,7 @@ const
   AnthropicUrl = "https://api.anthropic.com/v1/messages"
   AnthropicVersion = "2023-06-01"
   BedrockAnthropicVersion = "bedrock-2023-05-31"
+  DefaultBedrockModel = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
   ## What the viewer's speech bubble can actually show (~4 wrapped lines).
   MaxSayLen = 160
 
@@ -42,10 +43,8 @@ type
     apiKey: string          ## anthropic transport
     sidecarEndpoint: string
     bedrockEndpoint: string ## local Bedrock transport
-    bedrockModels: seq[string]  ## candidates, tried in order on denial
-    bedrockModel: int           ## index into bedrockModels
     bedrockToken: string
-    model: string
+    model*: string
     maxOutputTokens: int
     timeoutSeconds: int
     disabled: bool    ## true once credentials are known-unavailable
@@ -64,35 +63,15 @@ proc resolveApiKey(): string =
     echo "focus llm: failed to fetch ANTHROPIC_API_KEY_URI: ", error.msg
     result = ""
 
-proc bedrockModelIds(): seq[string] =
-  ## Bedrock inference-profile candidates, tried in order. BEDROCK_MODEL
-  ## pins a single id; without it, fall through this list — model access is
-  ## a per-account Marketplace subscription, so an id that works in one
-  ## account 403s in another.
+proc bedrockModelId*(): string =
+  ## Single pinned Bedrock inference-profile id: BEDROCK_MODEL if configured,
+  ## otherwise the default Haiku profile. Never switches to alternate models.
   let pinned = getEnv("BEDROCK_MODEL").strip()
-  if pinned.len > 0:
-    return @[pinned]
-  ## Haiku leads: hosted Bedrock capacity is shared account-wide and the
-  ## sonnet profiles run out of daily tokens first.
-  @[
-    "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-    "us.anthropic.claude-sonnet-4-6",
-    "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
-  ]
+  if pinned.len > 0: pinned
+  else: DefaultBedrockModel
 
-proc tryNextBedrockModel(client: LlmClient, why: string): bool =
-  if client.transport != ltBedrock or
-      client.bedrockModel + 1 >= client.bedrockModels.len:
-    return false
-  client.bedrockModel.inc
-  echo "focus llm: ", client.bedrockModels[client.bedrockModel - 1],
-    " unusable (", why, "); falling back to ",
-    client.bedrockModels[client.bedrockModel]
-  true
-
-proc bedrockUrl(client: LlmClient): string =
-  client.bedrockEndpoint & "/model/" &
-    client.bedrockModels[client.bedrockModel] & "/invoke"
+proc bedrockUrl*(client: LlmClient): string =
+  client.bedrockEndpoint & "/model/" & client.model & "/invoke"
 
 proc newLlmClient*(config: GameConfig): LlmClient =
   result = LlmClient(
@@ -105,7 +84,10 @@ proc newLlmClient*(config: GameConfig): LlmClient =
   if sidecarEndpoint.len > 0:
     result.transport = ltSidecar
     result.sidecarEndpoint = sidecarEndpoint.strip(chars = {'/'}, leading = false)
-    result.model = getEnv("COWORLD_LLM_MODEL", "anthropic/claude-haiku-4.5")
+    let sidecarModel = getEnv("COWORLD_LLM_MODEL").strip()
+    result.model =
+      if sidecarModel.len > 0: sidecarModel
+      else: "anthropic/claude-haiku-4.5"
     result.curl = newCurly()
     return
   let bedrockEndpoint = getEnv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME").strip()
@@ -118,7 +100,7 @@ proc newLlmClient*(config: GameConfig): LlmClient =
       else: "https://bedrock-runtime." & region & ".amazonaws.com"
     result.transport = ltBedrock
     result.bedrockEndpoint = endpoint.strip(chars = {'/'}, leading = false)
-    result.bedrockModels = bedrockModelIds()
+    result.model = bedrockModelId()
     result.bedrockToken = bedrockToken
     result.curl = newCurly()
     echo "focus llm: bedrock transport, url ", result.bedrockUrl
@@ -410,7 +392,7 @@ proc extractJsonObject*(text: string): JsonNode =
     raise newException(FocusError, "response must be a JSON object: " & quoteHead(text))
 
 proc completeText(client: LlmClient, system, user: string, slot: int,
-    policy: string, ply, retry: int): string =
+    policy: string, ply: int): string =
   var body = %*{
     "max_tokens": client.maxOutputTokens,
     "system": system,
@@ -440,7 +422,7 @@ proc completeText(client: LlmClient, system, user: string, slot: int,
     headers["anthropic-version"] = AnthropicVersion
     url = AnthropicUrl
   let capture = getEnv(CogameSaveTrajectoryUriEnv).len > 0
-  if capture: client.nativeAttempts.add(nativeAttempt(policy, ply, slot, retry, $body))
+  if capture: client.nativeAttempts.add(nativeAttempt(policy, ply, slot, 0, $body))
   let started = epochTime()
   var response: Response
   try:
@@ -458,17 +440,12 @@ proc completeText(client: LlmClient, system, user: string, slot: int,
   if response.code == 401 or response.code == 403:
     client.lastFailureCause = "provider"
     let detail = response.body[0 .. min(response.body.high, 400)]
-    if "Model access is denied" in response.body and
-        client.tryNextBedrockModel("no model access"):
-      raise newException(FocusError,
-        "bedrock model access denied: " & detail)
     client.disabled = true
     raise newException(FocusError,
       "llm auth failed (" & $response.code & ") at " & url & ": " & detail)
   if response.code == 429:
     client.lastFailureCause = "provider"
     let detail = response.body[0 .. min(response.body.high, 300)]
-    discard client.tryNextBedrockModel("throttled")
     raise newException(FocusError, "llm throttled (429): " & detail)
   if response.code < 200 or response.code >= 300:
     client.lastFailureCause = "provider"
@@ -583,44 +560,32 @@ proc decide*(
       if client.transport == ltNone: "no LLM credentials configured"
       else: "LLM transport disabled")
   let system = systemPrompt(sim, seat, selection)
-  var lastError = "no valid model reply"
-  for attempt in 0 .. 1:
+  let user = userPrompt(sim, seat, prompt, header)
+  try:
+    let rawText = client.completeText(system, user, seat,
+      sim.config.players[seat].name, sim.ply)
+    client.lastFailureCause = "model_rejection"
+    let payload = extractJsonObject(rawText)
+    let decision = parseDecision(sim, seat, payload)
+    var probe = sim
+    probe.applyMove(seat, decision.move)
     client.lastFailureCause = ""
-    var user = userPrompt(sim, seat, prompt, header)
-    if attempt > 0:
-      user.add("\nYour previous reply was invalid. Reply with ONLY one " &
-        "JSON object matching the required schema and one legal option from " &
-        "the list above.")
-    try:
-      let rawText = client.completeText(system, user, seat,
-        sim.config.players[seat].name, sim.ply, attempt)
-      client.lastFailureCause = "model_rejection"
-      let payload = extractJsonObject(rawText)
-      let decision = parseDecision(sim, seat, payload)
-      ## Reject illegal picks here so the retry carries the hint.
-      var probe = sim
-      probe.applyMove(seat, decision.move)
-      client.lastFailureCause = ""
-      if capture:
-        client.nativeAttempts[^1].parsedAction = decision.decisionJson()
-        let rawSay =
-          if payload.hasKey("say") and payload["say"].kind == JString:
-            payload["say"].getStr()
-          else:
-            ""
-        client.nativeAttempts[^1].accepted = rawSay == decision.say
-        if not client.nativeAttempts[^1].accepted:
-          client.nativeAttempts[^1].rejectionReason = some("native parser normalized speech")
-      return decision
-    except CatchableError as error:
-      lastError = error.msg
-      if client.lastFailureCause.len == 0:
-        client.lastFailureCause = "provider"
-      if capture and client.nativeAttempts.len > 0:
-        client.nativeAttempts[^1].accepted = false
-        client.nativeAttempts[^1].rejectionReason = some(error.msg)
-      echo "focus llm: seat ", seat, " attempt ", attempt, " failed: ",
-        error.msg
-      if client.disabled:
-        break
-  raise newException(FocusError, "model decision failed: " & lastError)
+    if capture:
+      client.nativeAttempts[^1].parsedAction = decision.decisionJson()
+      let rawSay =
+        if payload.hasKey("say") and payload["say"].kind == JString:
+          payload["say"].getStr()
+        else:
+          ""
+      client.nativeAttempts[^1].accepted = rawSay == decision.say
+      if not client.nativeAttempts[^1].accepted:
+        client.nativeAttempts[^1].rejectionReason = some("native parser normalized speech")
+    return decision
+  except CatchableError as error:
+    if client.lastFailureCause.len == 0:
+      client.lastFailureCause = "provider"
+    if capture and client.nativeAttempts.len > 0:
+      client.nativeAttempts[^1].accepted = false
+      client.nativeAttempts[^1].rejectionReason = some(error.msg)
+    echo "focus llm: seat ", seat, " failed: ", error.msg
+    raise newException(FocusError, "model decision failed: " & error.msg)

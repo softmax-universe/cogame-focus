@@ -78,6 +78,38 @@ suite "scripted baseline":
     check client.lastFailureCause == ""
     sim.applyMove(sim.turn, decision.move)
 
+  test "bedrock transport pins a single configured model ID":
+    let keys = [
+      "COWORLD_LLM_ENDPOINT",
+      "AWS_ENDPOINT_URL_BEDROCK_RUNTIME",
+      "AWS_BEARER_TOKEN_BEDROCK",
+      "BEDROCK_MODEL",
+      "ANTHROPIC_API_KEY",
+      "ANTHROPIC_API_KEY_URI"
+    ]
+    var saved: seq[(string, string, bool)]
+    for key in keys:
+      saved.add((key, getEnv(key), existsEnv(key)))
+      delEnv(key)
+    defer:
+      for (key, value, existed) in saved:
+        if existed:
+          putEnv(key, value)
+        else:
+          delEnv(key)
+    putEnv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", "http://127.0.0.1:9999")
+    putEnv("AWS_BEARER_TOKEN_BEDROCK", "test-token")
+    putEnv("BEDROCK_MODEL", "pinned-bedrock-test-model")
+    let pinnedClient = newLlmClient(fixture(3, maxPlies = 4))
+    check pinnedClient.model == "pinned-bedrock-test-model"
+    check pinnedClient.bedrockUrl() ==
+      "http://127.0.0.1:9999/model/pinned-bedrock-test-model/invoke"
+    delEnv("BEDROCK_MODEL")
+    let defaultClient = newLlmClient(fixture(3, maxPlies = 4))
+    check defaultClient.model == "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+    check defaultClient.bedrockUrl() ==
+      "http://127.0.0.1:9999/model/us.anthropic.claude-haiku-4-5-20251001-v1:0/invoke"
+
   test "extractJsonObject accepts bare or single-fenced JSON objects only":
     let bare = extractJsonObject("""{"say":"hi","move":{"from":"c7","count":1,"dir":"E"}}""")
     check bare["move"]["from"].getStr() == "c7"

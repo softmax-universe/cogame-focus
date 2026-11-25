@@ -8,7 +8,7 @@ Set the game's private `COGAME_SAVE_TRAJECTORY_URI` destination; absent a
 destination, capture is disabled.
 
 Capture retains actual request bodies, exposed call-ID headers, received
-response bodies, retries and the frozen pre-move public board with the acting
+response bodies, and the frozen pre-move public board with the acting
 seat's private operator prompt. It joins these to the actual applied move and
 speech. Native speech normalization and rejected or missing proposals cannot
 become real-model targets; failed turns fail the episode with an explicit
@@ -34,8 +34,9 @@ python3 tools/test_native_capture.py /tmp/focus /tmp/focus-player /tmp/focus-nat
 ```
 
 The native system fixture checks capture on/off replay and outcome equality,
-retries, fenced JSON replies, explicit failed episodes (model rejection,
-missing credentials, provider error, timeout, external illegal/disconnect/timeout),
+single-call per-turn enforcement, pinned Bedrock model ID, fenced JSON replies,
+explicit failed episodes (model rejection, ambiguous object, missing
+credentials, provider error/429/403, timeout, external illegal/disconnect/timeout),
 normalized speech, private operator isolation, missing usage, and family
 equality across alias-only seeds.
 Fixture replies are synthetic software evidence, never training teachers.

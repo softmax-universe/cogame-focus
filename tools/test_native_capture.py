@@ -18,7 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
-def make_provider(fail_ply=None, fail_mode="model_rejection"):
+def make_provider(state, fail_ply=None, fail_mode="model_rejection", transport="sidecar"):
     class Provider(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -30,10 +30,15 @@ def make_provider(fail_ply=None, fail_mode="model_rejection"):
             body = json.loads(raw)
             user = body["messages"][0]["content"]
             ply = int(re.search(r"Ply (\d+) of", user)[1])
-            slot = self.headers["X-Coworld-Player-Slot"]
-            assert "PRIVATE_OPERATOR_" + slot in user
-            assert "PRIVATE_OPERATOR_" + str(1 - int(slot)) not in user
-            retry = "Your previous reply was invalid" in user
+            state["count"] += 1
+            state["paths"].append(self.path)
+            state["models"].append(body.get("model"))
+            state["users"].append(user)
+            assert "Your previous reply was invalid" not in user, "unexpected recovery prompt"
+            if transport == "sidecar":
+                slot = self.headers["X-Coworld-Player-Slot"]
+                assert "PRIVATE_OPERATOR_" + slot in user
+                assert "PRIVATE_OPERATOR_" + str(1 - int(slot)) not in user
             legal = user.split("YOUR LEGAL OPTIONS:\n", 1)[1].split("\n\n", 1)[0]
             move = re.search(r"([a-h][1-8]) \(h\d+\): (\d+)([NSEW])", legal)
             action = {"say": "hello"}
@@ -51,22 +56,33 @@ def make_provider(fail_ply=None, fail_mode="model_rejection"):
                     self.end_headers()
                     self.wfile.write(err)
                     return
+                if fail_mode == "provider_429":
+                    err = json.dumps({"error": "rate limited"}).encode()
+                    self.send_response(429)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(err)))
+                    self.end_headers()
+                    self.wfile.write(err)
+                    return
+                if fail_mode == "provider_403":
+                    err = json.dumps({"message": "Model access is denied"}).encode()
+                    self.send_response(403)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(err)))
+                    self.end_headers()
+                    self.wfile.write(err)
+                    return
                 if fail_mode == "timeout":
                     time.sleep(2.5)
                     return
-                if not retry:
-                    text = "I think I will play " + json.dumps(action)
-                else:
+                if fail_mode == "ambiguous_object":
                     bad = dict(action)
-                    if "move" in bad:
-                        bad_move = dict(bad["move"])
-                        bad_move["direction"] = bad_move.pop("dir")
-                        bad["move"] = bad_move
-                    else:
-                        bad["place"] = {"to": bad["place"]}
+                    bad["place"] = "c1"
+                    if "move" not in bad:
+                        bad["move"] = {"from": "b7", "count": 1, "dir": "E"}
                     text = json.dumps(bad)
-            elif ply == 1 and not retry:
-                text = "invalid fixture reply"
+                else:
+                    text = "I think I will play " + json.dumps(action)
             else:
                 if ply == 3:
                     action["say"] = "s" * 300
@@ -75,9 +91,10 @@ def make_provider(fail_ply=None, fail_mode="model_rejection"):
                     text = f"```json\n{text}\n```"
                 elif ply == 4:
                     text = f"```\n{text}\n```"
+            response_model = body.get("model", "pinned-bedrock-model-id")
             response = json.dumps(
                 {
-                    "model": body["model"],
+                    "model": response_model,
                     "stop_reason": "end_turn",
                     "content": [{"type": "text", "text": text}],
                     "usage": None if ply == 4 else {"input_tokens": 100, "output_tokens": 20},
@@ -186,8 +203,11 @@ def run(
     fail_ply=None,
     fail_mode="model_rejection",
     scripted=False,
+    transport="sidecar",
 ):
     tag = f"{variant['id']}-seed{seed}-capture{capture}"
+    if transport != "sidecar":
+        tag += f"-{transport}"
     if not model_enabled:
         tag += "-scripted" if scripted else "-offline"
     if fail_ply is not None:
@@ -217,6 +237,7 @@ def run(
         "ANTHROPIC_API_KEY_URI",
         "AWS_ENDPOINT_URL_BEDROCK_RUNTIME",
         "AWS_BEARER_TOKEN_BEDROCK",
+        "BEDROCK_MODEL",
     ):
         env.pop(key, None)
     episode = f"focus-native-capture-fixture-{tag}"
@@ -233,12 +254,21 @@ def run(
     )
     if not capture:
         env.pop("COGAME_SAVE_TRAJECTORY_URI")
-    provider = ThreadingHTTPServer(("127.0.0.1", 0), make_provider(fail_ply=fail_ply, fail_mode=fail_mode))
+    provider_state = {"count": 0, "paths": [], "models": [], "users": []}
+    provider = ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        make_provider(provider_state, fail_ply=fail_ply, fail_mode=fail_mode, transport=transport),
+    )
     thread = threading.Thread(target=provider.serve_forever, daemon=True)
     thread.start()
     if model_enabled:
-        env["COWORLD_LLM_ENDPOINT"] = f"http://127.0.0.1:{provider.server_port}"
-        env["COWORLD_LLM_MODEL"] = "native-capture-fixture"
+        if transport == "bedrock":
+            env["AWS_ENDPOINT_URL_BEDROCK_RUNTIME"] = f"http://127.0.0.1:{provider.server_port}"
+            env["AWS_BEARER_TOKEN_BEDROCK"] = "fixture-bedrock-token"
+            env["BEDROCK_MODEL"] = "pinned-bedrock-model-id"
+        else:
+            env["COWORLD_LLM_ENDPOINT"] = f"http://127.0.0.1:{provider.server_port}"
+            env["COWORLD_LLM_MODEL"] = "native-capture-fixture"
     children = []
     streams = []
     expect_failure = fail_ply is not None or (not model_enabled and not scripted)
@@ -272,8 +302,26 @@ def run(
         if expect_failure:
             assert rc != 0, f"expected nonzero exit on failure ({tag})"
             assert not (root / "results.json").exists(), "failed episode must not publish official results"
-            expected_cause = fail_mode if fail_ply is not None else "missing"
+            cause_map = {
+                "model_rejection": "model_rejection",
+                "ambiguous_object": "model_rejection",
+                "provider": "provider",
+                "provider_429": "provider",
+                "provider_403": "provider",
+                "timeout": "timeout",
+            }
+            expected_cause = cause_map[fail_mode] if fail_ply is not None else "missing"
             expected_ply = (fail_ply - 1) if fail_ply is not None else 0
+            expected_calls = fail_ply if fail_ply is not None else 0
+            assert provider_state["count"] == expected_calls, (
+                f"expected exactly {expected_calls} model call(s), got {provider_state['count']}"
+            )
+            if transport == "bedrock" and expected_calls > 0:
+                assert provider_state["paths"] == ["/model/pinned-bedrock-model-id/invoke"] * expected_calls, (
+                    f"bedrock switched models: {provider_state['paths']}"
+                )
+            elif model_enabled and expected_calls > 0:
+                assert provider_state["models"] == ["native-capture-fixture"] * expected_calls
             assert replay["results"] is None
             assert replay["failure"]["status"] == "failed"
             assert replay["failure"]["cause"] == expected_cause
@@ -297,16 +345,27 @@ def run(
                 if expected_cause == "missing":
                     assert last["attempts"] == []
                 else:
-                    assert len(last["attempts"]) == 2
-                    assert all(not a["accepted"] for a in last["attempts"])
-                    if expected_cause == "provider":
-                        assert all(a["http_status"] == 503 for a in last["attempts"])
+                    assert len(last["attempts"]) == 1
+                    assert not last["attempts"][0]["accepted"]
+                    expected_http = {"provider": 503, "provider_429": 429, "provider_403": 403}.get(fail_mode)
+                    if expected_http is not None:
+                        assert last["attempts"][0]["http_status"] == expected_http
             return None, replay
         assert rc == 0
         results = json.loads((root / "results.json").read_text())
         assert results["reason"] in ("cap", "no-moves")
         assert 1 <= results["plies"] <= config["maxPlies"]
         assert abs(sum(results["scores"]) - 1.0) < 1e-9
+        if model_enabled and not scripted:
+            assert provider_state["count"] == results["plies"], (
+                f"expected 1 model call per ply ({results['plies']}), got {provider_state['count']}"
+            )
+            if transport == "bedrock":
+                assert provider_state["paths"] == ["/model/pinned-bedrock-model-id/invoke"] * results["plies"]
+            else:
+                assert provider_state["models"] == ["native-capture-fixture"] * results["plies"]
+        else:
+            assert provider_state["count"] == 0
         if capture:
             trace = root / "trajectory.jsonl"
             rows = [json.loads(line) for line in trace.read_text().splitlines()]
@@ -323,17 +382,16 @@ def run(
                 assert len(rows) == results["plies"] + 1
                 for row in rows[:-1]:
                     attempts = row["attempts"]
+                    assert len(attempts) == 1
                     ply = row["observation"]["view"]["ply"] + 1
-                    if ply == 1:
-                        assert len(attempts) == 2 and not attempts[0]["accepted"]
-                        assert attempts[1]["accepted"]
-                        assert row["selected_attempt_id"] == attempts[1]["attempt_id"]
-                    elif ply == 3:
+                    if ply == 3:
                         assert row["action_status"] == "rejected"
                         assert row["selected_attempt_id"] is None
                         assert len(row["executed_action"]["say"]) <= 160
                     else:
                         assert row["action_status"] == "accepted"
+                        assert attempts[0]["accepted"]
+                        assert row["selected_attempt_id"] == attempts[0]["attempt_id"]
                     if ply == 4:
                         assert attempts[0]["input_tokens"] is None
                         assert attempts[0]["output_tokens"] is None
@@ -485,6 +543,14 @@ def main():
     game, player, destination = map(lambda value: Path(value).resolve(), sys.argv[1:])
     destination.mkdir(mode=0o700, exist_ok=False)
     manifest = json.loads((Path(__file__).resolve().parents[1] / "coworld_manifest_template.json").read_text())
+    assert manifest["player"][0]["id"] == "focus-player"
+    assert "PLAYER_SCRIPTED" not in manifest["player"][0].get("env", {})
+    assert manifest["player"][1]["id"] == "focus-tactician"
+    assert manifest["player"][1]["env"]["PLAYER_SCRIPTED"] == "1"
+    assert [p["player_id"] for p in manifest["certification"]["players"]] == [
+        "focus-tactician",
+        "focus-tactician",
+    ]
     variant = manifest["variants"][0]
     for seed in (42, 43, 44):
         captured = run(game, player, destination, variant, True, seed)
@@ -493,11 +559,17 @@ def main():
     captured_fail = run(game, player, destination, variant, True, 42, fail_ply=2, fail_mode="model_rejection")
     ordinary_fail = run(game, player, destination, variant, False, 42, fail_ply=2, fail_mode="model_rejection")
     assert captured_fail == ordinary_fail, "capture changed model-rejection failure replay"
+    run(game, player, destination, variant, True, 42, fail_ply=2, fail_mode="ambiguous_object")
     captured_off = run(game, player, destination, variant, True, 42, model_enabled=False)
     ordinary_off = run(game, player, destination, variant, False, 42, model_enabled=False)
     assert captured_off == ordinary_off, "capture changed missing-credentials failure replay"
     run(game, player, destination, variant, True, 42, fail_ply=2, fail_mode="provider")
+    run(game, player, destination, variant, True, 42, fail_ply=2, fail_mode="provider_429")
+    run(game, player, destination, variant, True, 42, fail_ply=2, fail_mode="provider_403")
     run(game, player, destination, variant, True, 42, fail_ply=2, fail_mode="timeout")
+    # Bedrock transport: pinned model only, single call on 429 and 403 access denial, no model switching.
+    run(game, player, destination, variant, True, 42, fail_ply=2, fail_mode="provider_429", transport="bedrock")
+    run(game, player, destination, variant, True, 42, fail_ply=2, fail_mode="provider_403", transport="bedrock")
     run(game, player, destination, variant, True, 42, model_enabled=False, scripted=True)
     run_external_failure_test(game, player, destination, variant, "illegal")
     run_external_failure_test(game, player, destination, variant, "disconnect")
@@ -508,9 +580,10 @@ def main():
         families[seed] = json.loads(trace.read_text().splitlines()[-1])["seed_family"]
     assert families[42] == families[44] and families[42] != families[43]
     print(
-        "native capture, fenced JSON, retries, explicit failed episodes "
-        "(model_rejection, missing, provider, timeout, external illegal/disconnect/timeout), "
-        "genuine scripted play, and family grouping PASS"
+        "native capture, single-call per turn, pinned Bedrock model (429/403 no-switch), "
+        "fenced JSON, explicit unscored failed episodes (model_rejection, ambiguous_object, "
+        "missing, provider 503/429/403, timeout, external illegal/disconnect/timeout), "
+        "genuine scripted play, manifest certification check, and family grouping PASS"
     )
 
 
