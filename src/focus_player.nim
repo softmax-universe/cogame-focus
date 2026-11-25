@@ -59,6 +59,10 @@ when isMainModule:
       of "final":
         echo "focus player: final scores ", payload{"scores"}
         break
+      of "error":
+        echo "focus player: episode failed (", payload{"cause"}.getStr(), "): ",
+          payload{"detail"}.getStr()
+        break
       else:
         discard
     except CatchableError as error:

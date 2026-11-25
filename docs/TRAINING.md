@@ -11,8 +11,9 @@ Capture retains actual request bodies, exposed call-ID headers, received
 response bodies, retries and the frozen pre-move public board with the acting
 seat's private operator prompt. It joins these to the actual applied move and
 speech. Native speech normalization and rejected or missing proposals cannot
-become real-model targets; failed turns forfeit the seat rather than
-substituting a scripted move. Unattributed external actions stay unknown;
+become real-model targets; failed turns fail the episode with an explicit
+cause, nonzero exit, preserved diagnostics, and no official scores rather
+than substituting a scripted move. Unattributed external actions stay unknown;
 missing usage, model/token identities and likelihoods are not invented.
 Use `collect-hosted`, `prepare-hosted-data` and SLIME through the
 research package for authenticated receipt admission and token/mask checks.
@@ -33,9 +34,10 @@ python3 tools/test_native_capture.py /tmp/focus /tmp/focus-player /tmp/focus-nat
 ```
 
 The native system fixture checks capture on/off replay and outcome equality,
-retries, fenced JSON replies, rejected-reply and offline forfeits, normalized
-speech, private operator isolation, missing usage, and family equality across
-alias-only seeds.
+retries, fenced JSON replies, explicit failed episodes (model rejection,
+missing credentials, provider error, timeout, external illegal/disconnect/timeout),
+normalized speech, private operator isolation, missing usage, and family
+equality across alias-only seeds.
 Fixture replies are synthetic software evidence, never training teachers.
 Output directories must be new. Capture alone does not establish teacher
 strength, online RL readiness or hosted learned-checkpoint parity.

@@ -18,7 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
-def make_provider(fail_ply=None):
+def make_provider(fail_ply=None, fail_mode="model_rejection"):
     class Provider(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -43,6 +43,17 @@ def make_provider(fail_ply=None):
                 assert "DROP:" in legal
                 action["place"] = "c1"
             if fail_ply is not None and ply == fail_ply:
+                if fail_mode == "provider":
+                    err = json.dumps({"error": "upstream unavailable"}).encode()
+                    self.send_response(503)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(err)))
+                    self.end_headers()
+                    self.wfile.write(err)
+                    return
+                if fail_mode == "timeout":
+                    time.sleep(2.5)
+                    return
                 if not retry:
                     text = "I think I will play " + json.dumps(action)
                 else:
@@ -164,12 +175,23 @@ class SimpleWebSocket:
             pass
 
 
-def run(game, player, output, variant, capture, seed, model_enabled=True, fail_ply=None, scripted=False):
+def run(
+    game,
+    player,
+    output,
+    variant,
+    capture,
+    seed,
+    model_enabled=True,
+    fail_ply=None,
+    fail_mode="model_rejection",
+    scripted=False,
+):
     tag = f"{variant['id']}-seed{seed}-capture{capture}"
     if not model_enabled:
         tag += "-scripted" if scripted else "-offline"
     if fail_ply is not None:
-        tag += f"-fail{fail_ply}"
+        tag += f"-{fail_mode}-fail{fail_ply}"
     root = output / tag
     root.mkdir(mode=0o700)
     config = dict(variant["game_config"])
@@ -177,7 +199,7 @@ def run(game, player, output, variant, capture, seed, model_enabled=True, fail_p
     config.update(
         seed=seed,
         turnDelayMs=0,
-        llmTimeoutSeconds=2,
+        llmTimeoutSeconds=1 if fail_mode == "timeout" else 2,
         player_connect_timeout_seconds=5,
         episodeTimeoutSeconds=120,
         shutdownGraceSeconds=1,
@@ -211,7 +233,7 @@ def run(game, player, output, variant, capture, seed, model_enabled=True, fail_p
     )
     if not capture:
         env.pop("COGAME_SAVE_TRAJECTORY_URI")
-    provider = ThreadingHTTPServer(("127.0.0.1", 0), make_provider(fail_ply=fail_ply))
+    provider = ThreadingHTTPServer(("127.0.0.1", 0), make_provider(fail_ply=fail_ply, fail_mode=fail_mode))
     thread = threading.Thread(target=provider.serve_forever, daemon=True)
     thread.start()
     if model_enabled:
@@ -219,6 +241,7 @@ def run(game, player, output, variant, capture, seed, model_enabled=True, fail_p
         env["COWORLD_LLM_MODEL"] = "native-capture-fixture"
     children = []
     streams = []
+    expect_failure = fail_ply is not None or (not model_enabled and not scripted)
     try:
         log = (root / "game.log").open("wb")
         streams.append(log)
@@ -242,50 +265,55 @@ def run(game, player, output, variant, capture, seed, model_enabled=True, fail_p
                 player_env["PLAYER_SCRIPTED"] = "1"
             player_env["COWORLD_PLAYER_WS_URL"] = f"ws://127.0.0.1:{port}/player?slot={seat}&token=fixture-{seat}"
             children.append(subprocess.Popen([str(player)], env=player_env, stdout=log, stderr=subprocess.STDOUT))
-        assert server.wait(timeout=120) == 0
+        rc = server.wait(timeout=120)
         for child in children[1:]:
             assert child.wait(timeout=5) == 0
-        results = json.loads((root / "results.json").read_text())
         replay = json.loads((root / "replay.json").read_text())
-        if fail_ply is not None:
-            assert results["reason"] == "forfeit"
-            assert results["plies"] == fail_ply - 1
-            forfeiting_seat = (results["first"] + fail_ply - 1) % 2
-            assert results["scores"][1 - forfeiting_seat] == 1.0
-            assert results["scores"][forfeiting_seat] == 0.0
-        elif not model_enabled and not scripted:
-            assert results["reason"] == "forfeit"
-            assert results["plies"] == 0
-            forfeiting_seat = results["first"]
-            assert results["scores"][1 - forfeiting_seat] == 1.0
-            assert results["scores"][forfeiting_seat] == 0.0
-        else:
-            assert results["reason"] in ("cap", "no-moves")
-            assert 1 <= results["plies"] <= config["maxPlies"]
+        if expect_failure:
+            assert rc != 0, f"expected nonzero exit on failure ({tag})"
+            assert not (root / "results.json").exists(), "failed episode must not publish official results"
+            expected_cause = fail_mode if fail_ply is not None else "missing"
+            expected_ply = (fail_ply - 1) if fail_ply is not None else 0
+            assert replay["results"] is None
+            assert replay["failure"]["status"] == "failed"
+            assert replay["failure"]["cause"] == expected_cause
+            assert replay["failure"]["ply"] == expected_ply
+            assert not any(ev["kind"] == "end" for ev in replay["events"])
+            if capture:
+                trace = root / "trajectory.jsonl"
+                rows = [json.loads(line) for line in trace.read_text().splitlines()]
+                assert trace.stat().st_mode & 0o077 == 0
+                assert rows[-1]["status"] == "failed"
+                assert rows[-1]["outcome"]["cause"] == expected_cause
+                assert rows[-1]["outcome"]["plies"] == expected_ply
+                assert rows[-1]["participant_outcomes"] == {}
+                assert len(rows) == expected_ply + 2
+                last = rows[-2]
+                expected_action_status = "rejected" if expected_cause == "model_rejection" else "missing"
+                assert last["action_status"] == expected_action_status
+                assert last["executed_action"] is None
+                assert last["selected_attempt_id"] is None
+                assert last["terminal"] is True
+                if expected_cause == "missing":
+                    assert last["attempts"] == []
+                else:
+                    assert len(last["attempts"]) == 2
+                    assert all(not a["accepted"] for a in last["attempts"])
+                    if expected_cause == "provider":
+                        assert all(a["http_status"] == 503 for a in last["attempts"])
+            return None, replay
+        assert rc == 0
+        results = json.loads((root / "results.json").read_text())
+        assert results["reason"] in ("cap", "no-moves")
+        assert 1 <= results["plies"] <= config["maxPlies"]
+        assert abs(sum(results["scores"]) - 1.0) < 1e-9
         if capture:
             trace = root / "trajectory.jsonl"
             rows = [json.loads(line) for line in trace.read_text().splitlines()]
             assert trace.stat().st_mode & 0o077 == 0
             assert rows[-1]["status"] == "completed"
             assert rows[-1]["outcome"] == results
-            if fail_ply is not None:
-                assert len(rows) == fail_ply + 1
-                last = rows[-2]
-                assert last["action_status"] == "rejected"
-                assert last["executed_action"] is None
-                assert last["selected_attempt_id"] is None
-                assert last["terminal"] is True
-                assert len(last["attempts"]) == 2
-                assert all(not a["accepted"] for a in last["attempts"])
-            elif not model_enabled and not scripted:
-                assert len(rows) == 2
-                last = rows[0]
-                assert last["action_status"] == "missing"
-                assert last["executed_action"] is None
-                assert last["selected_attempt_id"] is None
-                assert last["terminal"] is True
-                assert last["attempts"] == []
-            elif scripted:
+            if scripted:
                 assert len(rows) == results["plies"] + 1
                 for row in rows[:-1]:
                     assert row["action_status"] == "accepted"
@@ -330,15 +358,15 @@ def run(game, player, output, variant, capture, seed, model_enabled=True, fail_p
             stream.close()
 
 
-def run_external_forfeit_test(game, player, output, variant, mode):
-    """Verify external policy legal move, illegal-action forfeit, and disconnect forfeit."""
+def run_external_failure_test(game, player, output, variant, mode):
+    """Verify external policy legal move plus illegal-action, disconnect, and timeout failures."""
     root = output / f"external-{mode}"
     root.mkdir(mode=0o700)
     config = dict(variant["game_config"])
     config.update(
         seed=42,
         turnDelayMs=0,
-        llmTimeoutSeconds=3,
+        llmTimeoutSeconds=1 if mode == "timeout" else 3,
         player_connect_timeout_seconds=5,
         episodeTimeoutSeconds=120,
         tokens=["fixture-0", "fixture-1"],
@@ -404,7 +432,7 @@ def run_external_forfeit_test(game, player, output, variant, mode):
         turns = 0
         while True:
             msg = ws.recv_json()
-            if msg is None or msg.get("type") == "final":
+            if msg is None or msg.get("type") in ("final", "error"):
                 break
             if msg.get("type") == "observation":
                 turns += 1
@@ -417,14 +445,23 @@ def run_external_forfeit_test(game, player, output, variant, mode):
                     ws.close()
                     ws = None
                     break
-        assert server.wait(timeout=15) == 0
+                elif mode == "timeout":
+                    # Deliberately do not reply; wait for server error/close.
+                    pass
+        assert server.wait(timeout=15) != 0
         assert children[1].wait(timeout=5) == 0
-        results = json.loads((root / "results.json").read_text())
-        assert results["reason"] == "forfeit"
-        assert results["plies"] == 2
-        assert results["scores"] == [0.0, 1.0]
+        assert not (root / "results.json").exists(), "failed external episode must not publish official results"
+        replay = json.loads((root / "replay.json").read_text())
+        expected_cause = {"illegal": "model_rejection", "disconnect": "disconnected", "timeout": "timeout"}[mode]
+        assert replay["results"] is None
+        assert replay["failure"]["status"] == "failed"
+        assert replay["failure"]["cause"] == expected_cause
+        assert replay["failure"]["ply"] == 2
+        assert not any(ev["kind"] == "end" for ev in replay["events"])
         rows = [json.loads(line) for line in (root / "trajectory.jsonl").read_text().splitlines()]
-        assert rows[-1]["status"] == "completed"
+        assert rows[-1]["status"] == "failed"
+        assert rows[-1]["outcome"]["cause"] == expected_cause
+        assert rows[-1]["participant_outcomes"] == {}
         expected_status = "rejected" if mode == "illegal" else "missing"
         assert rows[-2]["action_status"] == expected_status
         assert rows[-2]["executed_action"] is None
@@ -453,23 +490,27 @@ def main():
         captured = run(game, player, destination, variant, True, seed)
         ordinary = run(game, player, destination, variant, False, seed)
         assert captured == ordinary, "capture changed the native outcome or replay"
-    captured_fail = run(game, player, destination, variant, True, 42, fail_ply=2)
-    ordinary_fail = run(game, player, destination, variant, False, 42, fail_ply=2)
-    assert captured_fail == ordinary_fail, "capture changed rejected-reply forfeit game"
+    captured_fail = run(game, player, destination, variant, True, 42, fail_ply=2, fail_mode="model_rejection")
+    ordinary_fail = run(game, player, destination, variant, False, 42, fail_ply=2, fail_mode="model_rejection")
+    assert captured_fail == ordinary_fail, "capture changed model-rejection failure replay"
     captured_off = run(game, player, destination, variant, True, 42, model_enabled=False)
     ordinary_off = run(game, player, destination, variant, False, 42, model_enabled=False)
-    assert captured_off == ordinary_off, "capture changed offline forfeit game"
+    assert captured_off == ordinary_off, "capture changed missing-credentials failure replay"
+    run(game, player, destination, variant, True, 42, fail_ply=2, fail_mode="provider")
+    run(game, player, destination, variant, True, 42, fail_ply=2, fail_mode="timeout")
     run(game, player, destination, variant, True, 42, model_enabled=False, scripted=True)
-    run_external_forfeit_test(game, player, destination, variant, "illegal")
-    run_external_forfeit_test(game, player, destination, variant, "disconnect")
+    run_external_failure_test(game, player, destination, variant, "illegal")
+    run_external_failure_test(game, player, destination, variant, "disconnect")
+    run_external_failure_test(game, player, destination, variant, "timeout")
     families = {}
     for seed in (42, 43, 44):
         trace = destination / f"standard-seed{seed}-captureTrue" / "trajectory.jsonl"
         families[seed] = json.loads(trace.read_text().splitlines()[-1])["seed_family"]
     assert families[42] == families[44] and families[42] != families[43]
     print(
-        "native capture, fenced JSON, retries, rejected-reply forfeit, offline forfeit, "
-        "genuine scripted play, external illegal/disconnect forfeit, and family grouping PASS"
+        "native capture, fenced JSON, retries, explicit failed episodes "
+        "(model_rejection, missing, provider, timeout, external illegal/disconnect/timeout), "
+        "genuine scripted play, and family grouping PASS"
     )
 
 

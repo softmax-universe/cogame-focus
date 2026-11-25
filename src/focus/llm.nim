@@ -8,9 +8,10 @@
 ##   ANTHROPIC_API_KEY               - the key itself
 ##   ANTHROPIC_API_KEY_URI           - a URI holding the key
 ## Prompt seats require working model credentials and a valid legal JSON reply;
-## rejected or missing decisions raise FocusError and forfeit the seat. The
-## built-in scripted bot is a separate fieldable policy: a player that
-## registers as scripted plays it deliberately, LLM or not.
+## rejected, missing, or provider-failed decisions raise FocusError and fail
+## the episode without awarding scores. The built-in scripted bot is a separate
+## fieldable policy: a player that registers as scripted plays it deliberately,
+## LLM or not.
 
 import
   std/[json, options, os, random, strutils, times],
@@ -35,6 +36,7 @@ type
 
   LlmClient* = ref object
     nativeAttempts*: seq[DecisionAttempt]
+    lastFailureCause*: string
     curl: Curly
     transport: LlmTransport
     apiKey: string          ## anthropic transport
@@ -129,7 +131,7 @@ proc newLlmClient*(config: GameConfig): LlmClient =
   else:
     result.transport = ltNone
     result.disabled = true
-    echo "focus llm: no LLM credentials; prompt seats will forfeit"
+    echo "focus llm: no LLM credentials; prompt seats will fail"
 
 proc newScriptedClient*(config: GameConfig): LlmClient =
   ## Offline training needs the same seeded minimax policy without transport.
@@ -440,10 +442,21 @@ proc completeText(client: LlmClient, system, user: string, slot: int,
   let capture = getEnv(CogameSaveTrajectoryUriEnv).len > 0
   if capture: client.nativeAttempts.add(nativeAttempt(policy, ply, slot, retry, $body))
   let started = epochTime()
-  let response = client.curl.post(url, headers, $body, client.timeoutSeconds)
+  var response: Response
+  try:
+    response = client.curl.post(url, headers, $body, client.timeoutSeconds)
+  except CatchableError as error:
+    if capture:
+      client.nativeAttempts[^1].latencyMs = some(float(int((epochTime() - started) * 1000)))
+    let lower = error.msg.toLowerAscii()
+    client.lastFailureCause =
+      if "timeout" in lower or "timed out" in lower: "timeout"
+      else: "provider"
+    raise newException(FocusError, "llm transport failed: " & error.msg)
   if capture:
     client.nativeAttempts[^1].receiveNativeResponse(response, "", int((epochTime() - started) * 1000))
   if response.code == 401 or response.code == 403:
+    client.lastFailureCause = "provider"
     let detail = response.body[0 .. min(response.body.high, 400)]
     if "Model access is denied" in response.body and
         client.tryNextBedrockModel("no model access"):
@@ -453,19 +466,31 @@ proc completeText(client: LlmClient, system, user: string, slot: int,
     raise newException(FocusError,
       "llm auth failed (" & $response.code & ") at " & url & ": " & detail)
   if response.code == 429:
+    client.lastFailureCause = "provider"
     let detail = response.body[0 .. min(response.body.high, 300)]
     discard client.tryNextBedrockModel("throttled")
     raise newException(FocusError, "llm throttled (429): " & detail)
   if response.code < 200 or response.code >= 300:
+    client.lastFailureCause = "provider"
     raise newException(FocusError, "anthropic error " & $response.code &
       ": " & response.body[0 .. min(response.body.high, 300)])
-  let payload = parseJson(response.body)
+  var payload: JsonNode
+  try:
+    payload = parseJson(response.body)
+  except CatchableError as error:
+    client.lastFailureCause = "provider"
+    raise newException(FocusError, "invalid provider JSON: " & error.msg)
+  if payload.kind != JObject or not payload.hasKey("content") or payload["content"].kind != JArray:
+    client.lastFailureCause = "provider"
+    raise newException(FocusError, "invalid provider payload: missing content array")
   if payload{"stop_reason"}.getStr() == "refusal":
+    client.lastFailureCause = "model_rejection"
     raise newException(FocusError, "anthropic refusal")
   for contentBlock in payload["content"]:
     if contentBlock{"type"}.getStr() == "text":
       result.add(contentBlock{"text"}.getStr())
   if payload{"stop_reason"}.getStr() == "max_tokens" and '{' notin result:
+    client.lastFailureCause = "model_rejection"
     raise newException(FocusError, "reply cut off at max_tokens before " &
       "any JSON: " & result[0 .. min(result.high, 160)].replace("\n", " "))
 
@@ -545,29 +570,37 @@ proc decide*(
 ): Decision =
   ## One decision for one seat. Scripted seats play the minimax baseline;
   ## prompt seats require a valid legal model reply and raise FocusError on
-  ## failure so the server forfeits the seat instead of substituting a move.
+  ## failure so the server fails the episode instead of substituting a move.
+  client.lastFailureCause = ""
   let capture = getEnv(CogameSaveTrajectoryUriEnv).len > 0
   if capture:
     client.nativeAttempts.setLen(0)
   if scripted:
     return client.scriptedAction(sim, seat)
   if client.disabled:
-    raise newException(FocusError, "no LLM credentials configured")
+    client.lastFailureCause = if client.transport == ltNone: "missing" else: "provider"
+    raise newException(FocusError,
+      if client.transport == ltNone: "no LLM credentials configured"
+      else: "LLM transport disabled")
   let system = systemPrompt(sim, seat, selection)
   var lastError = "no valid model reply"
   for attempt in 0 .. 1:
+    client.lastFailureCause = ""
     var user = userPrompt(sim, seat, prompt, header)
     if attempt > 0:
       user.add("\nYour previous reply was invalid. Reply with ONLY one " &
         "JSON object matching the required schema and one legal option from " &
         "the list above.")
     try:
-      let payload = extractJsonObject(client.completeText(system, user, seat,
-        sim.config.players[seat].name, sim.ply, attempt))
+      let rawText = client.completeText(system, user, seat,
+        sim.config.players[seat].name, sim.ply, attempt)
+      client.lastFailureCause = "model_rejection"
+      let payload = extractJsonObject(rawText)
       let decision = parseDecision(sim, seat, payload)
       ## Reject illegal picks here so the retry carries the hint.
       var probe = sim
       probe.applyMove(seat, decision.move)
+      client.lastFailureCause = ""
       if capture:
         client.nativeAttempts[^1].parsedAction = decision.decisionJson()
         let rawSay =
@@ -581,6 +614,8 @@ proc decide*(
       return decision
     except CatchableError as error:
       lastError = error.msg
+      if client.lastFailureCause.len == 0:
+        client.lastFailureCause = "provider"
       if capture and client.nativeAttempts.len > 0:
         client.nativeAttempts[^1].accepted = false
         client.nativeAttempts[^1].rejectionReason = some(error.msg)

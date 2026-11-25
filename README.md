@@ -15,11 +15,12 @@ Players can register a prompt, the built-in scripted tactician, or an
 external action policy over `focus.player.v2`. Each acting external player
 receives the public board, rules, and exact legal move IDs, then returns a
 move ID and optional table talk. The game validates and applies the move.
-Prompt players retain the original game-hosted Claude path and forfeit on
-missing credentials or rejected replies; external policies forfeit on
-rejected actions, timeouts, or disconnects. The **scripted baseline**
-(`PLAYER_SCRIPTED=1`) uses two-ply minimax on material, captures, and
-mobility as a dedicated fieldable policy.
+Prompt players retain the original game-hosted Claude path; missing
+credentials, provider/transport failures, or rejected replies fail the
+episode with a nonzero exit and no official scores. External policies
+likewise fail the episode on rejected actions, timeouts, or disconnects.
+The **scripted baseline** (`PLAYER_SCRIPTED=1`) uses two-ply minimax on
+material, captures, and mobility only when explicitly selected.
 
 Seats play under **anonymous cog names** (Sprocket, Gizmo, …): policy
 display names never reach the agents' prompts, so nobody can meta-game
@@ -64,8 +65,8 @@ nim r -d:release --path:src tests/test_bot.nim # scripted-baseline tests
 nim c -d:release -o:bin/focus src/focus.nim
 nim c -d:release -o:bin/focus-player src/focus_player.nim
 # See tmp/config.json for a two-seat fixture; run with COGAME_* env + 2
-# players. Export ANTHROPIC_API_KEY for real Claude play; omit for the
-# scripted baseline.
+# players. Export ANTHROPIC_API_KEY for real Claude play, or set
+# PLAYER_SCRIPTED=1 on a player for the scripted baseline.
 ```
 
 Coworld packaging (from a metta checkout):

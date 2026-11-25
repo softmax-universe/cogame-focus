@@ -34,6 +34,8 @@ proc receiveNativeResponse*(attempt: var DecisionAttempt, response: Response,
   # manufacture a raw HTTP header block or claim unexposed transport facts.
   attempt.rawResponse = %response.body
   attempt.latencyMs = some(latencyMs.float)
+  if response.code in 100 .. 599:
+    attempt.httpStatus = some(response.code)
   for (header, field) in [
       ("x-softmax-llm-call-id", "call"),
       ("x-coworld-checkpoint-sha256", "model"),
@@ -47,19 +49,24 @@ proc receiveNativeResponse*(attempt: var DecisionAttempt, response: Response,
       of "tokenizer": attempt.tokenizerIdentity = some(value)
       of "template": attempt.chatTemplateSha256 = some(value)
   if transportError.len > 0 or response.code < 200 or response.code >= 300: return
-  let payload = parseJson(response.body)
-  if payload.hasKey("model") and payload["model"].kind == JString:
-    attempt.model = some(payload["model"].getStr())
-  if payload.hasKey("stop_reason") and payload["stop_reason"].kind == JString:
-    attempt.stopReason = some(payload["stop_reason"].getStr())
-  let usage = payload{"usage"}
-  if not usage.isNil and usage.kind == JObject:
-    if usage.hasKey("input_tokens") and usage["input_tokens"].kind == JInt: attempt.inputTokens = some(usage["input_tokens"].getInt())
-    if usage.hasKey("output_tokens") and usage["output_tokens"].kind == JInt: attempt.outputTokens = some(usage["output_tokens"].getInt())
-  var text = ""
-  for part in payload["content"]:
-    if part{"type"}.getStr() == "text": text.add(part{"text"}.getStr())
-  attempt.response = %text
+  try:
+    let payload = parseJson(response.body)
+    if payload.kind != JObject: return
+    if payload.hasKey("model") and payload["model"].kind == JString:
+      attempt.model = some(payload["model"].getStr())
+    if payload.hasKey("stop_reason") and payload["stop_reason"].kind == JString:
+      attempt.stopReason = some(payload["stop_reason"].getStr())
+    let usage = payload{"usage"}
+    if not usage.isNil and usage.kind == JObject:
+      if usage.hasKey("input_tokens") and usage["input_tokens"].kind == JInt: attempt.inputTokens = some(usage["input_tokens"].getInt())
+      if usage.hasKey("output_tokens") and usage["output_tokens"].kind == JInt: attempt.outputTokens = some(usage["output_tokens"].getInt())
+    if payload.hasKey("content") and payload["content"].kind == JArray:
+      var text = ""
+      for part in payload["content"]:
+        if part{"type"}.getStr() == "text": text.add(part{"text"}.getStr())
+      attempt.response = %text
+  except CatchableError:
+    discard
 
 proc attachPromptView(selection: PromptSelection, observation: JsonNode,
     attempts: seq[DecisionAttempt]): JsonNode =
@@ -110,6 +117,21 @@ proc finishNativeTrajectory*(trajectory: DecisionTrajectory, game: Sim) =
   let outcome = game.resultsJson()
   var scores = newJObject()
   for seat in 0 ..< Seats: scores[$seat] = outcome["scores"][seat]
-  trajectory.finish(if game.reason in ["cap", "no-moves", "forfeit"]: esCompleted else: esTruncated,
+  trajectory.finish(if game.reason in ["cap", "no-moves"]: esCompleted else: esTruncated,
     outcome, scores)
+  trajectory.writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))
+
+proc finishFailedNativeTrajectory*(trajectory: DecisionTrajectory, game: Sim,
+    seat: int, cause, detail: string) =
+  if trajectory.isNil: return
+  let outcome = %*{
+    "status": "failed",
+    "cause": cause,
+    "detail": detail,
+    "seat": seat,
+    "plies": game.ply,
+    "maxPlies": game.config.maxPlies,
+    "first": game.first
+  }
+  trajectory.finish(esFailed, outcome, newJObject())
   trajectory.writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))
