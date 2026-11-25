@@ -1,0 +1,62 @@
+name: Build pinned native release candidate
+on:
+  push:
+    branches: [release/native-candidate-933fb3c6176b]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 933fb3c6176b778bebb315b1689084ea1bc16583
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+      - uses: docker/setup-buildx-action@v3
+      - name: Build source and preserve release images
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 933fb3c6176b778bebb315b1689084ea1bc16583
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          import json
+          p=Path('coworld_manifest_template.json');d=json.loads(p.read_text())
+          def pin(x):
+              if isinstance(x,dict):
+                  for k,v in x.items():
+                      if k=='source_url' and isinstance(v,str):
+                          x[k]=v.replace('/tree/main','/tree/933fb3c6176b778bebb315b1689084ea1bc16583').replace('/blob/main','/blob/933fb3c6176b778bebb315b1689084ea1bc16583')
+                      else:pin(v)
+              elif isinstance(x,list):
+                  for v in x:pin(v)
+          pin(d);Path('release-template.json').write_text(json.dumps(d))
+          PYTHON
+          sed '/^[[:space:]]*network: host[[:space:]]*$/d' compose.yaml > release-compose.yaml
+          uvx --from 'coworld[auth]==0.1.64' coworld build --project . --compose release-compose.yaml --version 0.1.8 --template release-template.json
+          mkdir -p "$RUNNER_TEMP/native-candidate"
+          cp -a dist "$RUNNER_TEMP/native-candidate/"
+          python3 - <<'PYTHON'
+          import json,os,pathlib
+          p=pathlib.Path(os.environ['RUNNER_TEMP'])/'native-candidate'
+          m=json.loads((p/'dist/coworld_manifest.json').read_text())
+          def images(x):
+              if isinstance(x,dict):
+                  for k,v in x.items():
+                      if k=='image' and isinstance(v,str): yield v
+                      else: yield from images(v)
+              elif isinstance(x,list):
+                  for v in x:yield from images(v)
+          (p/'image-tags.txt').write_text('\n'.join(sorted(set(images(m))))+'\n')
+          PYTHON
+          mapfile -t tags < "$RUNNER_TEMP/native-candidate/image-tags.txt"
+          docker save "${tags[@]}" | zstd -T0 -3 > "$RUNNER_TEMP/native-candidate/images.tar.zst"
+          (cd "$RUNNER_TEMP/native-candidate" && sha256sum images.tar.zst dist/coworld_manifest.json > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-candidate-933fb3c6176b778bebb315b1689084ea1bc16583
+          path: ${{ runner.temp }}/native-candidate
+          retention-days: 2
+          compression-level: 0
