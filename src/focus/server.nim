@@ -49,6 +49,8 @@ type
     pendingMove: Move
     pendingSay: string
     pendingAccepted: bool
+    pendingRejected: bool
+    pendingRejectReason: string
     playerSockets: Table[int, WebSocket]
     socketSlots: Table[WebSocket, int]
     globalSockets: HashSet[WebSocket]
@@ -275,6 +277,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       var seatPrompt: string
       var seatScripted: bool
       var external = false
+      var registered = false
       var header: string
       withLock stateLock:
         if state.sim.done:
@@ -293,6 +296,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         seatPrompt = state.prompts[seat]
         seatScripted = state.scripted[seat]
         external = state.external[seat]
+        registered = state.registered[seat]
         header = "Ply " & $(state.sim.ply + 1) & " of at most " &
           $config.maxPlies & "."
 
@@ -300,6 +304,15 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       if not state.trajectory.isNil:
         captureView = %*{"view":simCopy.tableStateJson(),
           "operator_prompt":seatPrompt, "header":header}
+      if not registered:
+        withLock stateLock:
+          echo "focus: seat ", seat, " not registered; forfeiting"
+          state.sim.forfeit(seat)
+          if not state.trajectory.isNil:
+            state.trajectory.recordRejectedDecision(state.selection, simCopy.ply, seat,
+              config.players[seat].name, captureView, @[], asMissing)
+          state.broadcastLocked()
+        break
       if external:
         var sent = false
         withLock stateLock:
@@ -307,6 +320,8 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             inc state.decisionId
             state.pendingSeat = seat
             state.pendingAccepted = false
+            state.pendingRejected = false
+            state.pendingRejectReason = ""
             state.pendingSay = ""
             state.playerSockets[seat].send($ %*{
               "type": "observation",
@@ -314,70 +329,109 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
               "observation": state.playerObservation(seat)
             })
             sent = true
-        let replyDeadline = min(epochTime() + config.llmTimeoutSeconds.float,
-          playDeadline)
+        let replyDeadline =
+          if playDeadline > 0.0:
+            min(epochTime() + config.llmTimeoutSeconds.float, playDeadline)
+          else:
+            epochTime() + config.llmTimeoutSeconds.float
         var accepted = false
+        var rejected = false
+        var rejectReason = ""
+        var disconnected = not sent
         var action: Move
         var say = ""
         while sent and epochTime() < replyDeadline:
           withLock stateLock:
             accepted = state.pendingAccepted
+            rejected = state.pendingRejected
+            rejectReason = state.pendingRejectReason
+            disconnected = not state.playerSockets.hasKey(seat)
             if accepted:
               action = state.pendingMove
               say = state.pendingSay
-          if accepted:
+          if accepted or rejected or disconnected:
             break
           sleep(50)
+        var forfeited = false
         withLock stateLock:
           state.pendingSeat = -1
           state.pendingAccepted = false
-          var applied: Move
+          state.pendingRejected = false
           if accepted:
             state.sim.recordSay(seat, say)
-            applied = action
+            state.sim.applyMove(seat, action)
+            if not state.trajectory.isNil:
+              state.trajectory.recordAppliedDecision(state.selection, simCopy.ply, seat,
+                config.players[seat].name, captureView,
+                Decision(move: action, say: say).decisionJson(), @[], aoUnknown)
+            echo "focus: external accepted seat ", seat
+            echo "focus: ply ", state.sim.ply, " seat ", seat, " ",
+              moveText(action),
+              " at ", (epochTime() - gameStart).int, "s"
           else:
-            applied = client.scriptedAction(state.sim, seat).move
-          echo "focus: external ", (if accepted: "accepted" else: "fallback"),
-            " seat ", seat
-          state.sim.applyMove(seat, applied)
-          if not state.trajectory.isNil:
-            state.trajectory.recordAppliedDecision(state.selection, simCopy.ply, seat,
-              config.players[seat].name, captureView,
-              Decision(move:applied, say:(if accepted:say else:"")).decisionJson(), not accepted, @[])
-          echo "focus: ply ", state.sim.ply, " seat ", seat, " ",
-            moveText(applied),
-            " at ", (epochTime() - gameStart).int, "s"
+            let why =
+              if rejected: "rejected: " & rejectReason
+              elif disconnected: "disconnected"
+              else: "timed out"
+            echo "focus: external seat ", seat, " forfeited (", why, ")"
+            state.sim.forfeit(seat)
+            if not state.trajectory.isNil:
+              let status = if rejected: asRejected else: asMissing
+              state.trajectory.recordRejectedDecision(state.selection, simCopy.ply, seat,
+                config.players[seat].name, captureView, @[], status)
+            forfeited = true
           state.broadcastLocked()
+        if forfeited:
+          break
         if config.turnDelayMs > 0:
           sleep(config.turnDelayMs)
         continue
 
       ## The slow part (Claude) runs outside the lock on a snapshot; only
       ## this thread mutates the sim, so the snapshot cannot go stale.
-      let decision = client.decide(simCopy, seat, seatPrompt,
-        scripted = seatScripted, selection = state.selection, header = header)
+      var decision: Decision
+      var decideError = ""
+      try:
+        decision = client.decide(simCopy, seat, seatPrompt,
+          scripted = seatScripted, selection = state.selection, header = header)
+      except CatchableError as error:
+        decideError = error.msg
 
+      if decideError.len > 0:
+        withLock stateLock:
+          echo "focus: seat ", seat, " forfeited (", decideError, ")"
+          state.sim.forfeit(seat)
+          if not state.trajectory.isNil:
+            let status = if client.nativeAttempts.len > 0: asRejected else: asMissing
+            state.trajectory.recordRejectedDecision(state.selection, simCopy.ply, seat,
+              config.players[seat].name, captureView, client.nativeAttempts, status)
+          state.broadcastLocked()
+        break
+
+      var forfeited = false
       withLock stateLock:
         echo "focus: ply ", state.sim.ply + 1, " seat ", seat, " ",
           moveText(decision.move), " at ", (epochTime() - gameStart).int, "s"
-        state.sim.recordSay(seat, decision.say)
-        var applied = decision.move
-        var engineFallback = false
+        var probe = state.sim
         try:
+          probe.applyMove(seat, decision.move)
+          state.sim.recordSay(seat, decision.say)
           state.sim.applyMove(seat, decision.move)
+          if not state.trajectory.isNil:
+            let origin = if seatScripted: aoTeacher else: aoUnknown
+            state.trajectory.recordAppliedDecision(state.selection, simCopy.ply, seat,
+              config.players[seat].name, captureView,
+              decision.decisionJson(), client.nativeAttempts, origin)
         except FocusError as error:
-          echo "focus: llm move rejected (", error.msg,
-            "); using scripted fallback"
-          let fallback = client.scriptedAction(state.sim, seat)
-          state.sim.applyMove(seat, fallback.move)
-          applied = fallback.move
-          engineFallback = true
-        if not state.trajectory.isNil:
-          state.trajectory.recordAppliedDecision(state.selection, simCopy.ply, seat,
-            config.players[seat].name, captureView,
-            Decision(move:applied, say:decision.say).decisionJson(),
-            engineFallback or client.nativeFallback, client.nativeAttempts)
+          echo "focus: seat ", seat, " move rejected (", error.msg, "); forfeiting"
+          state.sim.forfeit(seat)
+          if not state.trajectory.isNil:
+            state.trajectory.recordRejectedDecision(state.selection, simCopy.ply, seat,
+              config.players[seat].name, captureView, client.nativeAttempts, asRejected)
+          forfeited = true
         state.broadcastLocked()
+      if forfeited:
+        break
 
       if config.turnDelayMs > 0:
         sleep(config.turnDelayMs)
@@ -516,24 +570,49 @@ proc websocketHandler(
           echo "focus: slot ", slot, " delivered a prompt (",
             prompt.len, " chars", (if scripted: ", scripted" else: ""), ")"
         elif payload{"type"}.getStr() == "register" and
-            payload["control"].getStr() == "external":
+            payload{"control"}.getStr() == "external":
           withLock stateLock:
             state.registered[slot] = true
             state.external[slot] = true
           echo "focus: slot ", slot, " registered external policy"
         elif payload{"type"}.getStr() == "action":
+          if payload.kind != JObject or not payload.hasKey("id") or payload["id"].kind != JInt:
+            raise newException(FocusError, "action requires integer id")
           let id = payload["id"].getInt()
-          let moveId = payload["move"].getStr()
-          let say = cleanSay(payload{"say"}.getStr())
           withLock stateLock:
             if state.external[slot] and state.pendingSeat == slot and
-                state.decisionId == id and not state.pendingAccepted:
-              for move in state.sim.legalMoves(slot):
-                if moveText(move) == moveId:
-                  state.pendingMove = move
-                  state.pendingSay = say
-                  state.pendingAccepted = true
+                state.decisionId == id and not state.pendingAccepted and
+                not state.pendingRejected:
+              var bad = ""
+              for key in payload.keys:
+                if key notin ["type", "id", "move", "say"]:
+                  bad = "unexpected action field: " & key
                   break
+              if bad.len == 0 and (not payload.hasKey("move") or payload["move"].kind != JString):
+                bad = "action.move must be a string"
+              if bad.len == 0 and payload.hasKey("say") and
+                  payload["say"].kind notin {JString, JNull}:
+                bad = "action.say must be a string"
+              if bad.len == 0:
+                let moveId = payload["move"].getStr()
+                let say =
+                  if payload.hasKey("say") and payload["say"].kind == JString:
+                    cleanSay(payload["say"].getStr())
+                  else:
+                    ""
+                var matched = false
+                for move in state.sim.legalMoves(slot):
+                  if moveText(move) == moveId:
+                    state.pendingMove = move
+                    state.pendingSay = say
+                    state.pendingAccepted = true
+                    matched = true
+                    break
+                if not matched:
+                  bad = "illegal move: " & moveId
+              if bad.len > 0:
+                state.pendingRejected = true
+                state.pendingRejectReason = bad
       except CatchableError as error:
         echo "focus: ignoring bad player frame: ", error.msg
     of ErrorEvent:

@@ -61,44 +61,55 @@ proc receiveNativeResponse*(attempt: var DecisionAttempt, response: Response,
     if part{"type"}.getStr() == "text": text.add(part{"text"}.getStr())
   attempt.response = %text
 
+proc attachPromptView(selection: PromptSelection, observation: JsonNode,
+    attempts: seq[DecisionAttempt]): JsonNode =
+  result = copy(observation)
+  result["prompt_selection"] = selection.selectionMetadata()
+  result["prompt_attempts"] = newJArray()
+  for attempt in attempts:
+    if attempt.origin == aoModel:
+      result["prompt_attempts"].add(%*{"attempt_id": attempt.attemptId,
+        "prompt_template": selection.promptMetadata(attempt.request["system"].getStr(),
+          attempt.request["messages"][0]["content"].getStr())})
+
 proc recordAppliedDecision*(trajectory: DecisionTrajectory, selection: PromptSelection,
     ply, seat: int, policy: string, observation, action: JsonNode,
-    fallback: bool, evidence: seq[DecisionAttempt]) =
+    evidence: seq[DecisionAttempt], defaultOrigin: AttemptOrigin = aoUnknown) =
   if trajectory.isNil: return
   var attempts = evidence
   var selected = none(string)
   var status = asAccepted
-  var fallbackOrigin = none(string)
-  if fallback:
-    status = asFallback
-    fallbackOrigin = some("engine-tactician-or-unattributed-external")
-    for attempt in attempts.mitems: attempt.accepted = false
-  elif attempts.len > 0:
+  if attempts.len > 0:
     doAssert attempts[^1].parsedAction == action
     if attempts[^1].accepted: selected = some(attempts[^1].attemptId)
     else: status = asRejected
-  if attempts.len == 0:
-    var attempt = newDecisionAttempt($ply & "-" & $seat & "-unknown", policy, aoUnknown)
+  else:
+    let suffix = if defaultOrigin == aoTeacher: "-scripted" else: "-unknown"
+    var attempt = newDecisionAttempt($ply & "-" & $seat & suffix, policy, defaultOrigin)
     attempt.parsedAction = action
-    attempt.accepted = not fallback
+    attempt.accepted = true
     attempts.add(attempt)
-    if not fallback: selected = some(attempt.attemptId)
-  var view = copy(observation)
-  view["prompt_selection"] = selection.selectionMetadata()
-  view["prompt_attempts"] = newJArray()
-  for attempt in attempts:
-    if attempt.origin == aoModel:
-      view["prompt_attempts"].add(%*{"attempt_id": attempt.attemptId,
-        "prompt_template": selection.promptMetadata(attempt.request["system"].getStr(),
-          attempt.request["messages"][0]["content"].getStr())})
+    selected = some(attempt.attemptId)
+  let view = attachPromptView(selection, observation, attempts)
   trajectory.recordDecision($ply & "-" & $seat, $seat, view,
-    attempts, selected, action, status, fallbackOrigin = fallbackOrigin)
+    attempts, selected, action, status)
+
+proc recordRejectedDecision*(trajectory: DecisionTrajectory, selection: PromptSelection,
+    ply, seat: int, policy: string, observation: JsonNode,
+    evidence: seq[DecisionAttempt], status: ActionStatus = asRejected) =
+  if trajectory.isNil: return
+  var attempts = evidence
+  for attempt in attempts.mitems:
+    attempt.accepted = false
+  let view = attachPromptView(selection, observation, attempts)
+  trajectory.recordDecision($ply & "-" & $seat, $seat, view,
+    attempts, none(string), newJNull(), status, terminal = true)
 
 proc finishNativeTrajectory*(trajectory: DecisionTrajectory, game: Sim) =
   if trajectory.isNil: return
   let outcome = game.resultsJson()
   var scores = newJObject()
   for seat in 0 ..< Seats: scores[$seat] = outcome["scores"][seat]
-  trajectory.finish(if game.reason in ["cap", "no-moves"]: esCompleted else: esTruncated,
+  trajectory.finish(if game.reason in ["cap", "no-moves", "forfeit"]: esCompleted else: esTruncated,
     outcome, scores)
   trajectory.writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))

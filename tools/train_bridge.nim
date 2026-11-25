@@ -136,7 +136,7 @@ when isMainModule:
       response = %*{"response": $(if textMode: decisionJson(teacher) else: actionOf(teacher.move))}
     of "step":
       doAssert not game.done and request["decision_id"].getInt() == id
-      let action = parseJson(request["response"].getStr())
+      let action = extractJsonObject(request["response"].getStr())
       let seat = game.turn
       let parsed = parseDecision(game, seat, action)
       doAssert parsed.move in game.legalMoves(seat)

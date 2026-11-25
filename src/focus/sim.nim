@@ -48,7 +48,7 @@ type
     ply*: int                      ## plies played so far
     done*: bool
     winner*: int                   ## -1 for a draw (or while live)
-    reason*: string                ## "no-moves" | "cap" | "deadline"
+    reason*: string                ## "no-moves" | "cap" | "deadline" | "forfeit"
     events*: seq[GameEvent]
 
 const CogNames* = [
@@ -85,10 +85,9 @@ proc cellName*(cell: int): string =
 
 proc parseCell*(text: string): int =
   ## "e4" -> cell index; raises on anything that is not a playable square.
-  let t = text.strip().toLowerAscii()
-  if t.len != 2 or t[0] < 'a' or t[0] > 'h' or t[1] < '1' or t[1] > '8':
+  if text.len != 2 or text[0] < 'a' or text[0] > 'h' or text[1] < '1' or text[1] > '8':
     raise newException(FocusError, "bad square: " & text)
-  result = cellIndex(ord(t[0]) - ord('a'), ord(t[1]) - ord('1'))
+  result = cellIndex(ord(text[0]) - ord('a'), ord(text[1]) - ord('1'))
   if not validCell(result):
     raise newException(FocusError, "not a playable square: " & text)
 
@@ -108,11 +107,11 @@ proc step*(cell: int, dir: Direction, distance: int): int =
     result = -1
 
 proc parseDirection*(text: string): Direction =
-  case text.strip().toUpperAscii()
-  of "N", "NORTH", "UP": dirN
-  of "S", "SOUTH", "DOWN": dirS
-  of "E", "EAST", "RIGHT": dirE
-  of "W", "WEST", "LEFT": dirW
+  case text
+  of "N": dirN
+  of "S": dirS
+  of "E": dirE
+  of "W": dirW
   else: raise newException(FocusError, "bad direction: " & text)
 
 # ---- Setup ------------------------------------------------------------------
@@ -279,8 +278,7 @@ proc overflow(sim: var Sim, seat, cell: int, captured, reserved: var int) =
       inc captured
 
 proc applyMove*(sim: var Sim, seat: int, move: Move) =
-  ## One turn. Raises FocusError on anything illegal; the game server falls
-  ## back to the scripted baseline on a rejection.
+  ## One turn. Raises FocusError on anything illegal.
   if sim.done:
     raise newException(FocusError, "the game is over")
   if seat != sim.turn:
@@ -340,6 +338,19 @@ proc endEarly*(sim: var Sim) =
   if sim.done:
     return
   sim.settle("deadline")
+
+proc forfeit*(sim: var Sim, seat: int) =
+  ## Ends the game immediately, awarding the win to the opposing seat.
+  if sim.done:
+    return
+  if seat < 0 or seat >= Seats:
+    raise newException(FocusError, "invalid forfeit seat")
+  sim.done = true
+  sim.reason = "forfeit"
+  sim.winner = 1 - seat
+  sim.turn = -1
+  sim.addEvent(GameEvent(kind: evEnd, seat: sim.winner, fromCell: -1,
+    toCell: -1, reserveAfter: -1, text: "forfeit"))
 
 # ---- Results ----------------------------------------------------------------
 
@@ -457,8 +468,11 @@ proc replayMatch*(config: GameConfig, events: seq[GameEvent]): seq[Sim] =
         toCell: event.toCell))
     of evEnd:
       if not sim.done:
-        ## A deadline stop is not derivable from the moves alone.
-        sim.settle(event.text)
+        if event.text == "forfeit" and event.seat >= 0 and event.seat < Seats:
+          sim.forfeit(1 - event.seat)
+        else:
+          ## A deadline stop is not derivable from the moves alone.
+          sim.settle(event.text)
     result.add(sim)
 
 # ---- Event JSON -------------------------------------------------------------

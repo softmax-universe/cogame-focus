@@ -67,17 +67,17 @@ def play(seed, wording="canonical", prompt_seed=0, speech=False):
             teacher = json.loads(request({"kind": "teacher"})["response"])
             if speech:
                 teacher["say"] = "  PUBLIC-TALK-" + "x" * 200 + "  "
-                if "move" in teacher:
-                    teacher["move"]["count"] = str(teacher["move"]["count"])
-                    teacher["move"]["direction"] = teacher["move"].pop("dir").lower()
-                else:
-                    teacher["place"] = {"to": teacher["place"]}
             else:
                 teacher["say"] = ""
             if "place" in teacher:
                 drops += 1
+            raw_response = json.dumps(teacher)
+            if speech and index % 3 == 1:
+                raw_response = f"```json\n{raw_response}\n```"
+            elif speech and index % 3 == 2:
+                raw_response = f"```\n{raw_response}\n```"
             result = request(
-                {"kind": "step", "decision_id": index, "response": json.dumps(teacher)}
+                {"kind": "step", "decision_id": index, "response": raw_response}
             )
             assert result["kind"] == "accepted"
             action = result["action"]
@@ -117,9 +117,40 @@ for seed in (17, 946001):
 spoken = play(17, speech=True)
 assert spoken[3] > 0
 print(
-    "19 complete text games; speech and move/drop normalization PASS",
+    "19 complete text games; speech, fences, and strict move/drop grammar PASS",
     flush=True,
 )
+for bad_response in (
+    'Sure: {"say":"","move":{"from":"c7","count":1,"dir":"E"}}',
+    '{"say":"","move":{"from":"c7","count":"1","dir":"E"}}',
+    '{"say":"","move":{"from":"c7","count":1,"direction":"E"}}',
+    '{"say":"","move":{"from":"c7","count":1,"dir":"east"}}',
+    '{"say":"","move":{"from":"c7","dir":"E"}}',
+    '{"say":"","place":{"to":"a4"}}',
+    '{"say":"","move":{"place":"a4"}}',
+):
+    reset_line = json.dumps(
+        {
+            "kind": "reset",
+            "players": 2,
+            "seed": "17",
+            "promptVariant": "canonical",
+            "promptSeed": 0,
+            "split": "test",
+        }
+    )
+    step_line = json.dumps(
+        {"kind": "step", "decision_id": 0, "response": bad_response}
+    )
+    rejected = subprocess.run(
+        [str(BRIDGE), str(ROOT / "coworld_manifest_template.json"), "standard", "text"],
+        input=reset_line + "\n" + step_line + "\n",
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+    assert rejected.returncode != 0, f"expected bridge to reject {bad_response!r}"
+print("Bridge strict rejection checks PASS", flush=True)
 for wording in WORDINGS[-2:]:
     result = subprocess.run(
         [str(BRIDGE), str(ROOT / "coworld_manifest_template.json"), "standard", "text"],
