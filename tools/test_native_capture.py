@@ -548,7 +548,7 @@ def main():
     assert manifest["player"][1]["id"] == "focus-tactician"
     assert manifest["player"][1]["env"]["PLAYER_SCRIPTED"] == "1"
     assert [p["player_id"] for p in manifest["certification"]["players"]] == [
-        "focus-tactician",
+        "focus-player",
         "focus-tactician",
     ]
     variant = manifest["variants"][0]
