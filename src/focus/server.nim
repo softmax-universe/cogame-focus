@@ -654,16 +654,12 @@ proc websocketHandler(
                     cleanSay(payload["say"].getStr())
                   else:
                     ""
-                var matched = false
-                for move in state.sim.legalMoves(slot):
-                  if moveText(move) == moveId:
-                    state.pendingMove = move
-                    state.pendingSay = say
-                    state.pendingAccepted = true
-                    matched = true
-                    break
-                if not matched:
-                  bad = "illegal move: " & moveId
+                try:
+                  state.pendingMove = state.sim.parseMoveId(slot, moveId)
+                  state.pendingSay = say
+                  state.pendingAccepted = true
+                except FocusError as error:
+                  bad = error.msg
               if bad.len > 0:
                 state.pendingRejected = true
                 state.pendingRejectReason = bad

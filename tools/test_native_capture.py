@@ -40,13 +40,16 @@ def make_provider(state, fail_ply=None, fail_mode="model_rejection", transport="
                 assert "PRIVATE_OPERATOR_" + slot in user
                 assert "PRIVATE_OPERATOR_" + str(1 - int(slot)) not in user
             legal = user.split("YOUR LEGAL OPTIONS:\n", 1)[1].split("\n\n", 1)[0]
-            move = re.search(r"([a-h][1-8]) \(h\d+\): (\d+)([NSEW])", legal)
-            action = {"say": "hello"}
-            if move:
-                action["move"] = {"from": move[1], "count": int(move[2]), "dir": move[3]}
-            else:
-                assert "DROP:" in legal
-                action["place"] = "c1"
+            legal_ids = [item.strip() for line in legal.splitlines() for item in line.split(",") if item.strip()]
+            assert legal_ids, "missing legal move IDs in prompt"
+            move_id = legal_ids[0]
+            assert f'Example: {{"move": "{move_id}"}}' in user
+            action = {"move": move_id}
+            if ply != 1:
+                action["say"] = "hello"
+            stop_reason = "end_turn"
+            content = None
+            usage = None if ply == 4 else {"input_tokens": 100, "output_tokens": 20}
             if fail_ply is not None and ply == fail_ply:
                 if fail_mode == "provider":
                     err = json.dumps({"error": "upstream unavailable"}).encode()
@@ -78,9 +81,20 @@ def make_provider(state, fail_ply=None, fail_mode="model_rejection", transport="
                 if fail_mode == "ambiguous_object":
                     bad = dict(action)
                     bad["place"] = "c1"
-                    if "move" not in bad:
-                        bad["move"] = {"from": "b7", "count": 1, "dir": "E"}
                     text = json.dumps(bad)
+                elif fail_mode == "two_moves":
+                    second_id = legal_ids[1] if len(legal_ids) > 1 else move_id
+                    text = json.dumps({"move": move_id}) + " " + json.dumps({"move": second_id})
+                elif fail_mode == "unicode_arrow":
+                    text = json.dumps({"move": move_id.replace("->", "→")})
+                elif fail_mode == "max_tokens_thinking":
+                    stop_reason = "max_tokens"
+                    usage = {"input_tokens": 100, "output_tokens": 400}
+                    content = [
+                        {"type": "thinking", "text": "SECRET_COT_DO_NOT_LOG"},
+                        {"type": "text", "text": "I need to analyze this position carefully"},
+                    ]
+                    text = ""
                 else:
                     text = "I think I will play " + json.dumps(action)
             else:
@@ -95,9 +109,9 @@ def make_provider(state, fail_ply=None, fail_mode="model_rejection", transport="
             response = json.dumps(
                 {
                     "model": response_model,
-                    "stop_reason": "end_turn",
-                    "content": [{"type": "text", "text": text}],
-                    "usage": None if ply == 4 else {"input_tokens": 100, "output_tokens": 20},
+                    "stop_reason": stop_reason,
+                    "content": content if content is not None else [{"type": "text", "text": text}],
+                    "usage": usage,
                 }
             ).encode()
             self.send_response(200)
@@ -305,6 +319,9 @@ def run(
             cause_map = {
                 "model_rejection": "model_rejection",
                 "ambiguous_object": "model_rejection",
+                "two_moves": "model_rejection",
+                "unicode_arrow": "model_rejection",
+                "max_tokens_thinking": "model_rejection",
                 "provider": "provider",
                 "provider_429": "provider",
                 "provider_403": "provider",
@@ -316,6 +333,17 @@ def run(
             assert provider_state["count"] == expected_calls, (
                 f"expected exactly {expected_calls} model call(s), got {provider_state['count']}"
             )
+            game_log = (root / "game.log").read_text()
+            if fail_ply is not None and fail_mode == "max_tokens_thinking":
+                assert "stop_reason=max_tokens" in game_log
+                assert "output_tokens=400" in game_log
+                assert "blocks=[thinking,text]" in game_log
+                assert "SECRET_COT_DO_NOT_LOG" not in game_log
+                assert "SECRET_COT_DO_NOT_LOG" not in json.dumps(replay)
+            elif fail_ply is not None and expected_cause == "model_rejection":
+                assert "stop_reason=end_turn" in game_log
+                assert "output_tokens=20" in game_log
+                assert "blocks=[text]" in game_log
             if transport == "bedrock" and expected_calls > 0:
                 assert provider_state["paths"] == ["/model/pinned-bedrock-model-id/invoke"] * expected_calls, (
                     f"bedrock switched models: {provider_state['paths']}"
@@ -543,7 +571,9 @@ def main():
     game, player, destination = map(lambda value: Path(value).resolve(), sys.argv[1:])
     destination.mkdir(mode=0o700, exist_ok=False)
     manifest = json.loads((Path(__file__).resolve().parents[1] / "coworld_manifest_template.json").read_text())
+    assert manifest["game"]["runnable"]["env"]["COWORLD_LLM_ENABLED"] == "true"
     assert manifest["player"][0]["id"] == "focus-player"
+    assert manifest["player"][0]["env"]["COWORLD_LLM_ENABLED"] == "true"
     assert "PLAYER_SCRIPTED" not in manifest["player"][0].get("env", {})
     assert manifest["player"][1]["id"] == "focus-tactician"
     assert manifest["player"][1]["env"]["PLAYER_SCRIPTED"] == "1"
@@ -560,6 +590,9 @@ def main():
     ordinary_fail = run(game, player, destination, variant, False, 42, fail_ply=2, fail_mode="model_rejection")
     assert captured_fail == ordinary_fail, "capture changed model-rejection failure replay"
     run(game, player, destination, variant, True, 42, fail_ply=2, fail_mode="ambiguous_object")
+    run(game, player, destination, variant, True, 42, fail_ply=2, fail_mode="two_moves")
+    run(game, player, destination, variant, True, 42, fail_ply=2, fail_mode="unicode_arrow")
+    run(game, player, destination, variant, True, 42, fail_ply=2, fail_mode="max_tokens_thinking")
     captured_off = run(game, player, destination, variant, True, 42, model_enabled=False)
     ordinary_off = run(game, player, destination, variant, False, 42, model_enabled=False)
     assert captured_off == ordinary_off, "capture changed missing-credentials failure replay"

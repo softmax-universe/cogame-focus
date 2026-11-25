@@ -17,11 +17,7 @@ proc seedOf(value: string): int =
   int(hash and 0x7fffffff'u32)
 
 proc actionOf(move: Move): JsonNode =
-  if move.kind == mkPlace:
-    %*{"place": cellName(move.toCell)}
-  else:
-    %*{"move": {"from": cellName(move.fromCell),
-      "count": move.count, "dir": $move.dir}}
+  %*{"move": moveText(move)}
 
 proc decision(game: Sim, id: int, selection: PromptSelection): JsonNode =
   let seat = game.turn
@@ -41,16 +37,19 @@ proc decision(game: Sim, id: int, selection: PromptSelection): JsonNode =
     ],
     "speech_messages": [],
     "action_schema": {
-      "type": "object", "oneOf": [
-        {"required": ["place"]}, {"required": ["move"]}
-      ]
+      "type": "object",
+      "required": ["move"],
+      "additionalProperties": false,
+      "properties": {
+        "move": {"type": "string"},
+        "say": {"type": "string", "maxLength": 160}
+      }
     },
     "typed_question": newJNull()
   }
 
   result["semantic_view"]["prompt_template"] = selection.promptMetadata(
     result["messages"][0]["content"].getStr(), result["messages"][1]["content"].getStr())
-  result["action_schema"]["properties"] = %*{"say": {"type": "string", "maxLength": 160}}
 
 proc encoding(game: Sim, id: int): JsonNode =
   let seat = game.turn

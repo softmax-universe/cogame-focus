@@ -12,14 +12,10 @@ import
   std/[json, options, os, strutils],
   whisky
 
-const DefaultPrompt = """
-Play sound Focus. Take control of enemy stacks by landing on them, and
-prefer captures that strip enemy pieces off the bottom of tall stacks.
-Keep several stacks under your control so you always have moves; never
-leave your last stack where it can be buried. Bank reserve pieces from
-your own overflow and drop them to seize key stacks late. Use the table
-talk to needle your opponent, but never explain your real plan.
-"""
+const DefaultPrompt =
+  "Play strong Focus: capture enemy pieces by overflowing tall stacks, " &
+  "control multiple stacks to preserve mobility, and bank reserve pieces " &
+  "for key drops."
 
 when isMainModule:
   let url = getEnv("COWORLD_PLAYER_WS_URL")
