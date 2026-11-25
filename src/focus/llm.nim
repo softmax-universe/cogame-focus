@@ -334,17 +334,14 @@ proc systemPrompt*(sim: Sim, seat: int, selection: PromptSelection): string =
   let them = sim.seatName(1 - seat)
   selection.introduction(me, them) & "\n\n" & BoardRules & playRules & """
 
-OUTPUT FORMAT: Reply with ONLY one JSON object (bare or inside a single
-ordinary Markdown code fence) of the form {"move": "<exact legal move ID>"},
-with an optional "say" string (max 160 chars). Output no analysis or other
-text outside the JSON object."""
+Put your chosen legal move on the last line as {"move":"<exact legal move ID>"}.
+You may add a "say" field for short table talk."""
 
 proc actionInstruction(sim: Sim, seat: int): string =
   let legal = sim.legalMoves(seat)
   let example = if legal.len > 0: moveText(legal[0]) else: "drop @ c1"
-  "Reply with ONLY one JSON object copying one exact legal move ID from the " &
-    "list above (optional \"say\" string, max " & $MaxSayLen & " chars), " &
-    "with no analysis or extra text. Example: {\"move\": " & $(%example) & "}"
+  "Copy one move ID from the list above. Put your chosen move on the last line, like " &
+    $(%*{"move": example})
 
 proc userPrompt*(sim: Sim, seat: int, prompt: string, header: string): string =
   if header.len > 0:
@@ -374,10 +371,11 @@ proc quoteHead(text: string): string =
   result = result.replace("\n", " ")
 
 proc extractJsonObject*(text: string): JsonNode =
-  ## Parses exactly one JSON object, bare or inside a single ordinary outer
-  ## Markdown code fence (plain or json-tagged). Rejects surrounding prose,
-  ## extra objects, or non-object JSON values.
+  ## A standalone fenced object or the last answer line identifies the move.
   var body = text.strip()
+  let lastLine = body[body.rfind('\n') + 1 .. ^1].strip()
+  if lastLine.startsWith("{"):
+    body = lastLine
   if body.startsWith("```"):
     let nl = body.find('\n')
     if nl < 0:
