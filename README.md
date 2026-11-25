@@ -15,9 +15,11 @@ Players can register a prompt, the built-in scripted tactician, or an
 external action policy over `focus.player.v2`. Each acting external player
 receives the public board, rules, and exact legal move IDs, then returns a
 move ID and optional table talk. The game validates and applies the move.
-Prompt players retain the original game-hosted Claude path. The
-**scripted baseline** uses two-ply minimax on material, captures, and
-mobility; it also covers missing model credentials and timed-out actions.
+Prompt players retain the original game-hosted Claude path and forfeit on
+missing credentials or rejected replies; external policies forfeit on
+rejected actions, timeouts, or disconnects. The **scripted baseline**
+(`PLAYER_SCRIPTED=1`) uses two-ply minimax on material, captures, and
+mobility as a dedicated fieldable policy.
 
 Seats play under **anonymous cog names** (Sprocket, Gizmo, …): policy
 display names never reach the agents' prompts, so nobody can meta-game

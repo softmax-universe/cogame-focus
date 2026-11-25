@@ -722,6 +722,9 @@
     if (reason === "no-moves" && winner >= 0) {
       return name(winner) + " wins — " + name(loser) + " cannot move.";
     }
+    if (reason === "forfeit" && winner >= 0) {
+      return name(winner) + " wins — " + name(loser) + " forfeited.";
+    }
     if (winner < 0) {
       return (reason === "deadline" ? "Episode deadline — " :
         "Ply cap reached — ") + "draw on material.";
@@ -879,6 +882,7 @@
     var winner = results.win ? results.win.indexOf(true) : -1;
     switch (results.reason) {
       case "no-moves": return "opponent could not move";
+      case "forfeit": return "opponent forfeited";
       case "cap":
         return winner >= 0 ? "ply cap: won on material" :
           "ply cap: level on material";

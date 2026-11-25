@@ -47,6 +47,12 @@ suite "board geometry":
     check step(parseCell("e4"), dirW, 4) == parseCell("a4")
     check step(parseCell("e4"), dirW, 5) == -1
     check step(parseCell("b2"), dirW, 1) == -1   # a2 is off the board
+    for bad in ["E4", " e4", "e4 ", "i4", "e9", ""]:
+      expect FocusError:
+        discard parseCell(bad)
+    for badDir in ["n", "north", "NORTH", "UP", " N ", ""]:
+      expect FocusError:
+        discard parseDirection(badDir)
 
   test "every playable square has an on-board neighbour":
     for cell in 0 ..< Cells:
@@ -254,6 +260,29 @@ suite "endings":
     check sim.winner == 0
     sim.endEarly()                # idempotent
     check sim.events[^1].kind == evEnd
+
+  test "forfeit awards the win to the opponent and replays identically":
+    var sim = initSim(fixtureConfig(seed = 0))
+    sim.mv("c7", 1, dirE)         # seat 0 leads on material 19 vs 17
+    sim.forfeit(0)                # seat 0 forfeits despite material lead
+    check sim.done
+    check sim.reason == "forfeit"
+    check sim.winner == 1
+    check sim.turn == -1
+    sim.forfeit(0)                # idempotent
+    let results = sim.resultsJson()
+    check results["scores"][0].getFloat() == 0.0
+    check results["scores"][1].getFloat() == 1.0
+    check results["win"][1].getBool()
+    check results["reason"].getStr() == "forfeit"
+    var events: seq[GameEvent]
+    for event in sim.events:
+      events.add(eventFromJson(event.eventToJson()))
+    let frames = replayMatch(sim.config, events)
+    check frames[^1].done
+    check frames[^1].reason == "forfeit"
+    check frames[^1].winner == 1
+    check $frames[^1].tableStateJson() == $sim.tableStateJson()
 
 suite "replay":
   test "re-deriving frames from the event log reproduces the game":

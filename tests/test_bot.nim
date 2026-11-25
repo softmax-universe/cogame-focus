@@ -1,8 +1,8 @@
 ## The scripted baseline must play whole games without ever proposing an
-## illegal move — it is both the no-credentials fallback (offline
-## certification) and a fieldable policy, so this is the completion path.
+## illegal move — it is a fieldable policy (PLAYER_SCRIPTED=1). Model replies
+## must parse strictly with no compatibility shims or silent fallbacks.
 
-import std/[json, monotimes, times, unittest]
+import std/[json, monotimes, os, times, unittest]
 import focus/[llm, sim, prompts]
 
 proc fixture(seed: int, maxPlies = 160): GameConfig =
@@ -48,15 +48,59 @@ suite "scripted baseline":
         sim.captured[0] + sim.captured[1]
       check pieces == 36
 
-  test "decide falls back to scripted with no credentials":
+  test "decide raises for prompt seat without credentials, plays scripted seat":
+    let keys = [
+      "COWORLD_LLM_ENDPOINT",
+      "AWS_ENDPOINT_URL_BEDROCK_RUNTIME",
+      "AWS_BEARER_TOKEN_BEDROCK",
+      "ANTHROPIC_API_KEY",
+      "ANTHROPIC_API_KEY_URI"
+    ]
+    var saved: seq[(string, string, bool)]
+    for key in keys:
+      saved.add((key, getEnv(key), existsEnv(key)))
+      delEnv(key)
+    defer:
+      for (key, value, existed) in saved:
+        if existed:
+          putEnv(key, value)
+        else:
+          delEnv(key)
     let config = fixture(3, maxPlies = 4)
     let client = newLlmClient(config)
     var sim = initSim(config)
-    let decision = client.decide(sim, sim.turn, "attack the centre",
-      scripted = false, selection = PromptSelection())
+    expect FocusError:
+      discard client.decide(sim, sim.turn, "attack the centre",
+        scripted = false, selection = PromptSelection())
+    let decision = client.decide(sim, sim.turn, "",
+      scripted = true, selection = PromptSelection())
     sim.applyMove(sim.turn, decision.move)
 
-  test "model replies parse into moves and drops":
+  test "extractJsonObject accepts bare or single-fenced JSON objects only":
+    let bare = extractJsonObject("""{"say":"hi","move":{"from":"c7","count":1,"dir":"E"}}""")
+    check bare["move"]["from"].getStr() == "c7"
+    let fencedJson = extractJsonObject("```json\n{\"place\":\"a4\"}\n```")
+    check fencedJson["place"].getStr() == "a4"
+    let fencedPlain = extractJsonObject("  ```\n{\"place\":\"a4\"}\n```  ")
+    check fencedPlain["place"].getStr() == "a4"
+    let fencedCrlf = extractJsonObject("```JSON\r\n{\"place\":\"a4\"}\r\n```")
+    check fencedCrlf["place"].getStr() == "a4"
+    for bad in [
+      "",
+      "Sure, here is my move: {\"place\":\"a4\"}",
+      "{\"place\":\"a4\"} good luck",
+      "Here:\n```json\n{\"place\":\"a4\"}\n```",
+      "```json\n{\"place\":\"a4\"}\n```\nThanks",
+      "{\"place\":\"a4\"} {\"place\":\"b4\"}",
+      "```json\n{\"place\":\"a4\"}\n```\n```json\n{\"place\":\"b4\"}\n```",
+      "```python\n{\"place\":\"a4\"}\n```",
+      "```json {\"place\":\"a4\"}```",
+      "[1, 2, 3]"
+    ]:
+      expect FocusError:
+        discard extractJsonObject(bad)
+
+  test "model replies parse strictly into moves and drops":
     let config = fixture(0)
     var sim = initSim(config)
     let moved = parseDecision(sim, 0, parseJson(
@@ -66,19 +110,29 @@ suite "scripted baseline":
     check moved.move.toCell == parseCell("d7")
     check moved.say == "hi"
     sim.applyMove(0, moved.move)
+    let noSay = parseDecision(sim, 1, parseJson(
+      """{"move":{"from":"b6","count":1,"dir":"N"}}"""))
+    check noSay.say == ""
+    check noSay.move.dir == dirN
     let dropped = parseDecision(sim, 1, parseJson(
       """{"say":"","place":"a4"}"""))
     check dropped.move.kind == mkPlace
     check dropped.move.toCell == parseCell("a4")
-    let dropped2 = parseDecision(sim, 1, parseJson(
-      """{"move":{"place":"h5"}}"""))
-    check dropped2.move.toCell == parseCell("h5")
-    let stringy = parseDecision(sim, 1, parseJson(
-      """{"move":{"from":"B6","count":"1","direction":"north"}}"""))
-    check stringy.move.dir == dirN
-    check stringy.move.count == 1
-    expect FocusError:
-      discard parseDecision(sim, 1, parseJson("""{"say":"?"}"""))
-    expect FocusError:
-      discard parseDecision(sim, 1, parseJson(
-        """{"move":{"from":"a1","count":1,"dir":"N"}}"""))
+    for bad in [
+      """{"say":"?"}""",
+      """{"move":{"from":"a1","count":1,"dir":"N"}}""",
+      """{"move":{"place":"h5"}}""",
+      """{"place":{"to":"a4"}}""",
+      """{"move":{"from":"b6","count":"1","dir":"N"}}""",
+      """{"move":{"from":"b6","count":1,"direction":"N"}}""",
+      """{"move":{"from":"b6","count":1,"dir":"north"}}""",
+      """{"move":{"from":"B6","count":1,"dir":"N"}}""",
+      """{"move":{"from":"b6","dir":"N"}}""",
+      """{"move":{"from":"b6","count":0,"dir":"N"}}""",
+      """{"move":{"from":"b6","count":1,"dir":"N"},"place":"a4"}""",
+      """{"move":{"from":"b6","count":1,"dir":"N","extra":1}}""",
+      """{"move":{"from":"b6","count":1,"dir":"N"},"extra":1}""",
+      """{"say":123,"place":"a4"}"""
+    ]:
+      expect FocusError:
+        discard parseDecision(sim, 1, parseJson(bad))

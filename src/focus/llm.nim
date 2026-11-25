@@ -5,13 +5,12 @@
 ## Credentials, in order of preference:
 ##   COWORLD_LLM_ENDPOINT            - hosted sidecar
 ##   Bedrock bearer token            - local play
-##   ANTHROPIC_API_KEY                - the key itself
-##   ANTHROPIC_API_KEY_URI            - a URI holding the key
-## With no credentials every decision falls back to the always-legal
-## scripted baseline immediately (no retries, no network waits) so offline
-## certification still completes - this fallback is load-bearing. The same
-## scripted bot is also a fieldable policy: a player that registers as
-## scripted plays it deliberately, LLM or not.
+##   ANTHROPIC_API_KEY               - the key itself
+##   ANTHROPIC_API_KEY_URI           - a URI holding the key
+## Prompt seats require working model credentials and a valid legal JSON reply;
+## rejected or missing decisions raise FocusError and forfeit the seat. The
+## built-in scripted bot is a separate fieldable policy: a player that
+## registers as scripted plays it deliberately, LLM or not.
 
 import
   std/[json, options, os, random, strutils, times],
@@ -36,7 +35,6 @@ type
 
   LlmClient* = ref object
     nativeAttempts*: seq[DecisionAttempt]
-    nativeFallback*: bool
     curl: Curly
     transport: LlmTransport
     apiKey: string          ## anthropic transport
@@ -131,7 +129,7 @@ proc newLlmClient*(config: GameConfig): LlmClient =
   else:
     result.transport = ltNone
     result.disabled = true
-    echo "focus llm: no LLM credentials; using scripted fallback"
+    echo "focus llm: no LLM credentials; prompt seats will forfeit"
 
 proc newScriptedClient*(config: GameConfig): LlmClient =
   ## Offline training needs the same seeded minimax policy without transport.
@@ -342,16 +340,15 @@ proc systemPrompt*(sim: Sim, seat: int, selection: PromptSelection): string =
   let them = sim.seatName(1 - seat)
   selection.introduction(me, them) & "\n\n" & BoardRules & playRules & """
 
-OUTPUT FORMAT: reply with ONLY one JSON object, nothing else - no
-analysis, no explanation, no markdown fences, no text before or after
-the object. Your reply must begin with the character { and end with }.
-Decide silently; put any words for the table in the "say" field."""
+OUTPUT FORMAT: reply with ONLY one JSON object (bare or inside a single
+ordinary Markdown code fence), with no other text before or after it.
+Decide silently; put any table talk in the optional "say" field."""
 
 proc actionInstruction(sim: Sim, seat: int): string =
-  "It is your turn. Say one short line to the table (max " & $MaxSayLen &
-    " chars, may be empty) and pick exactly one LEGAL option from the " &
-    "list above.\n" &
-    "Reply with ONLY the JSON object (start with {, no other text): " &
+  "It is your turn. Pick exactly one LEGAL option from the list above, " &
+    "with an optional short \"say\" line to the table (max " & $MaxSayLen &
+    " chars).\n" &
+    "Reply with ONLY one JSON object: " &
     "{\"say\": \"...\", \"move\": {\"from\": \"e4\", " &
     "\"count\": 2, \"dir\": \"N\"}} to move, or {\"say\": \"...\", " &
     "\"place\": \"e4\"} to drop a reserve piece."
@@ -377,19 +374,38 @@ proc userPrompt*(sim: Sim, seat: int, prompt: string, header: string): string =
 
 # ---- Anthropic / Bedrock transport ------------------------------------------
 
-proc extractJsonObject(text: string): JsonNode =
-  ## Pulls the first {...} object out of a model response, tolerating fences.
-  let start = text.find('{')
-  let stop = text.rfind('}')
-  if start < 0 or stop <= start:
-    ## Quote the head of the reply so a hosted log shows WHAT the model
-    ## sent instead of JSON (prose, a refusal, a cut-off analysis...).
-    var head = text.strip()
-    if head.len > 160:
-      head = head[0 ..< 160] & "..."
-    raise newException(FocusError, "no JSON object in response: " &
-      head.replace("\n", " "))
-  parseJson(text[start .. stop])
+proc quoteHead(text: string): string =
+  result = text.strip()
+  if result.len > 160:
+    result = result[0 ..< 160] & "..."
+  result = result.replace("\n", " ")
+
+proc extractJsonObject*(text: string): JsonNode =
+  ## Parses exactly one JSON object, bare or inside a single ordinary outer
+  ## Markdown code fence (plain or json-tagged). Rejects surrounding prose,
+  ## extra objects, or non-object JSON values.
+  var body = text.strip()
+  if body.startsWith("```"):
+    let nl = body.find('\n')
+    if nl < 0:
+      raise newException(FocusError, "malformed code fence in response: " & quoteHead(text))
+    let tag = body[3 ..< nl].strip().toLowerAscii()
+    if tag.len > 0 and tag != "json":
+      raise newException(FocusError, "unsupported code fence tag '" & tag & "': " & quoteHead(text))
+    if not body.endsWith("```") or body.len < nl + 4:
+      raise newException(FocusError, "unterminated code fence in response: " & quoteHead(text))
+    let beforeClose = body[nl + 1 ..< body.len - 3]
+    if beforeClose.len == 0 or (beforeClose[^1] != '\n' and beforeClose[^1] != '\r'):
+      raise newException(FocusError, "closing code fence must be on its own line: " & quoteHead(text))
+    body = beforeClose.strip()
+  if body.len == 0 or body[0] != '{' or body[^1] != '}':
+    raise newException(FocusError, "response must be a single JSON object: " & quoteHead(text))
+  try:
+    result = parseJson(body)
+  except CatchableError as error:
+    raise newException(FocusError, "invalid JSON object (" & error.msg & "): " & quoteHead(text))
+  if result.kind != JObject:
+    raise newException(FocusError, "response must be a JSON object: " & quoteHead(text))
 
 proc completeText(client: LlmClient, system, user: string, slot: int,
     policy: string, ply, retry: int): string =
@@ -469,30 +485,44 @@ proc cleanSay*(text: string): string =
 
 proc parseDecision*(sim: Sim, seat: int, payload: JsonNode): Decision =
   ## Maps the model's JSON onto a Move (legality is checked by applyMove).
-  result.say = cleanSay(payload{"say"}.getStr())
-  if payload.hasKey("place") and payload["place"].kind != JNull:
-    let target = payload["place"]
-    let name = if target.kind == JObject: target{"to"}.getStr()
-      else: target.getStr()
-    result.move = Move(kind: mkPlace, fromCell: -1, toCell: parseCell(name))
-    return
-  let move = payload{"move"}
-  if move.isNil or move.kind != JObject:
+  if payload.isNil or payload.kind != JObject:
+    raise newException(FocusError, "response must be a JSON object")
+  for key in payload.keys:
+    if key notin ["say", "move", "place"]:
+      raise newException(FocusError, "unexpected field in response: " & key)
+  if payload.hasKey("say") and payload["say"].kind != JNull:
+    if payload["say"].kind != JString:
+      raise newException(FocusError, "say must be a string")
+    result.say = cleanSay(payload["say"].getStr())
+  let hasPlace = payload.hasKey("place") and payload["place"].kind != JNull
+  let hasMove = payload.hasKey("move") and payload["move"].kind != JNull
+  if hasPlace and hasMove:
+    raise newException(FocusError, "response cannot include both move and place")
+  if not hasPlace and not hasMove:
     raise newException(FocusError, "no move or place in response")
-  if move.hasKey("place"):
-    result.move = Move(kind: mkPlace, fromCell: -1,
-      toCell: parseCell(move["place"].getStr()))
+  if hasPlace:
+    let target = payload["place"]
+    if target.kind != JString:
+      raise newException(FocusError, "place must be a square string")
+    result.move = Move(kind: mkPlace, fromCell: -1, toCell: parseCell(target.getStr()))
     return
-  let fromCell = parseCell(move{"from"}.getStr())
-  var count = move{"count"}.getInt(0)
-  if count == 0 and move{"count"}.kind == JString:
-    try:
-      count = parseInt(move{"count"}.getStr())
-    except ValueError:
-      discard
-  if count <= 0:
-    count = 1
-  let dir = parseDirection(move{"dir"}.getStr(move{"direction"}.getStr()))
+  let move = payload["move"]
+  if move.kind != JObject:
+    raise newException(FocusError, "move must be a JSON object")
+  for key in move.keys:
+    if key notin ["from", "count", "dir"]:
+      raise newException(FocusError, "unexpected field in move: " & key)
+  if not move.hasKey("from") or move["from"].kind != JString:
+    raise newException(FocusError, "move.from must be a square string")
+  if not move.hasKey("count") or move["count"].kind != JInt:
+    raise newException(FocusError, "move.count must be an integer")
+  if not move.hasKey("dir") or move["dir"].kind != JString:
+    raise newException(FocusError, "move.dir must be a direction string")
+  let fromCell = parseCell(move["from"].getStr())
+  let count = move["count"].getInt()
+  if count < 1:
+    raise newException(FocusError, "move.count must be positive")
+  let dir = parseDirection(move["dir"].getStr())
   result.move = Move(kind: mkMove, fromCell: fromCell,
     toCell: step(fromCell, dir, count), count: count, dir: dir)
 
@@ -513,20 +543,24 @@ proc decide*(
   selection: PromptSelection,
   header = ""
 ): Decision =
-  ## One decision for one seat. Never raises: any failure falls back to
-  ## the scripted baseline so the game always advances.
+  ## One decision for one seat. Scripted seats play the minimax baseline;
+  ## prompt seats require a valid legal model reply and raise FocusError on
+  ## failure so the server forfeits the seat instead of substituting a move.
   let capture = getEnv(CogameSaveTrajectoryUriEnv).len > 0
   if capture:
     client.nativeAttempts.setLen(0)
-    client.nativeFallback = true
-  if scripted or client.disabled:
+  if scripted:
     return client.scriptedAction(sim, seat)
+  if client.disabled:
+    raise newException(FocusError, "no LLM credentials configured")
   let system = systemPrompt(sim, seat, selection)
+  var lastError = "no valid model reply"
   for attempt in 0 .. 1:
     var user = userPrompt(sim, seat, prompt, header)
     if attempt > 0:
-      user.add("\nYour previous reply was invalid. Respond with ONLY the " &
-        "requested JSON object and one option copied from the legal list.")
+      user.add("\nYour previous reply was invalid. Reply with ONLY one " &
+        "JSON object matching the required schema and one legal option from " &
+        "the list above.")
     try:
       let payload = extractJsonObject(client.completeText(system, user, seat,
         sim.config.players[seat].name, sim.ply, attempt))
@@ -536,12 +570,17 @@ proc decide*(
       probe.applyMove(seat, decision.move)
       if capture:
         client.nativeAttempts[^1].parsedAction = decision.decisionJson()
-        client.nativeAttempts[^1].accepted = payload == decision.decisionJson()
+        let rawSay =
+          if payload.hasKey("say") and payload["say"].kind == JString:
+            payload["say"].getStr()
+          else:
+            ""
+        client.nativeAttempts[^1].accepted = rawSay == decision.say
         if not client.nativeAttempts[^1].accepted:
-          client.nativeAttempts[^1].rejectionReason = some("native parser normalized action or speech")
-        client.nativeFallback = false
+          client.nativeAttempts[^1].rejectionReason = some("native parser normalized speech")
       return decision
     except CatchableError as error:
+      lastError = error.msg
       if capture and client.nativeAttempts.len > 0:
         client.nativeAttempts[^1].accepted = false
         client.nativeAttempts[^1].rejectionReason = some(error.msg)
@@ -549,5 +588,4 @@ proc decide*(
         error.msg
       if client.disabled:
         break
-  echo "focus llm: seat ", seat, " falling back to scripted decision"
-  client.scriptedAction(sim, seat)
+  raise newException(FocusError, "model decision failed: " & lastError)
